@@ -1,6 +1,3 @@
-import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type { Component, Focusable, TUI } from "@mariozechner/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { Theme } from "@mariozechner/pi-coding-agent";
@@ -14,7 +11,9 @@ import {
 	HEADER_LINES,
 	FOOTER_LINES_COMPACT,
 	FOOTER_LINES_DIALOG,
+	formatShortcut,
 } from "./types.js";
+import { captureCompletionOutput, captureTransferOutput, maybeBuildHandoffPreview, maybeWriteHandoffSnapshot } from "./handoff-utils.js";
 
 export class ReattachOverlay implements Component, Focusable {
 	focused = false;
@@ -33,6 +32,7 @@ export class ReattachOverlay implements Component, Focusable {
 	private lastWidth = 0;
 	private lastHeight = 0;
 	private finished = false;
+	private renderTimeout: ReturnType<typeof setTimeout> | null = null;
 
 	constructor(
 		tui: TUI,
@@ -40,6 +40,7 @@ export class ReattachOverlay implements Component, Focusable {
 		bgSession: { id: string; command: string; reason?: string; session: PtyTerminalSession },
 		config: InteractiveShellConfig,
 		done: (result: InteractiveShellResult) => void,
+		private onUnfocus?: () => void,
 	) {
 		this.tui = tui;
 		this.theme = theme;
@@ -52,7 +53,7 @@ export class ReattachOverlay implements Component, Focusable {
 				if (!bgSession.session.isScrolledUp()) {
 					bgSession.session.scrollToBottom();
 				}
-				this.tui.requestRender();
+				this.debouncedRender();
 			},
 			onExit: () => {
 				if (this.finished) return;
@@ -83,6 +84,16 @@ export class ReattachOverlay implements Component, Focusable {
 		return this.bgSession.session;
 	}
 
+	private debouncedRender(): void {
+		if (this.renderTimeout) {
+			clearTimeout(this.renderTimeout);
+		}
+		this.renderTimeout = setTimeout(() => {
+			this.renderTimeout = null;
+			this.tui.requestRender();
+		}, 16);
+	}
+
 	private startExitCountdown(): void {
 		this.stopCountdown();
 		this.countdownInterval = setInterval(() => {
@@ -103,87 +114,20 @@ export class ReattachOverlay implements Component, Focusable {
 	}
 
 	private captureCompletionOutput(): InteractiveShellResult["completionOutput"] {
-		const result = this.session.getTailLines({
-			lines: this.config.completionNotifyLines,
-			ansi: false,
-			maxChars: this.config.completionNotifyMaxChars,
-		});
-		return {
-			lines: result.lines,
-			totalLines: result.totalLinesInBuffer,
-			truncated: result.lines.length < result.totalLinesInBuffer || result.truncatedByChars,
-		};
+		return captureCompletionOutput(this.session, this.config);
 	}
 
 	/** Capture output for transfer action (Ctrl+T or dialog) */
 	private captureTransferOutput(): InteractiveShellResult["transferred"] {
-		const maxLines = this.config.transferLines;
-		const maxChars = this.config.transferMaxChars;
-
-		const result = this.session.getTailLines({
-			lines: maxLines,
-			ansi: false,
-			maxChars,
-		});
-
-		const truncated = result.lines.length < result.totalLinesInBuffer || result.truncatedByChars;
-
-		return {
-			lines: result.lines,
-			totalLines: result.totalLinesInBuffer,
-			truncated,
-		};
+		return captureTransferOutput(this.session, this.config);
 	}
 
 	private maybeBuildHandoffPreview(when: "exit" | "detach" | "kill" | "transfer"): InteractiveShellResult["handoffPreview"] | undefined {
-		if (!this.config.handoffPreviewEnabled) return undefined;
-		const lines = this.config.handoffPreviewLines;
-		const maxChars = this.config.handoffPreviewMaxChars;
-		if (lines <= 0 || maxChars <= 0) return undefined;
-
-		const result = this.session.getTailLines({
-			lines,
-			ansi: false,
-			maxChars,
-		});
-
-		return { type: "tail", when, lines: result.lines };
+		return maybeBuildHandoffPreview(this.session, when, this.config);
 	}
 
 	private maybeWriteHandoffSnapshot(when: "exit" | "detach" | "kill" | "transfer"): InteractiveShellResult["handoff"] | undefined {
-		if (!this.config.handoffSnapshotEnabled) return undefined;
-		const lines = this.config.handoffSnapshotLines;
-		const maxChars = this.config.handoffSnapshotMaxChars;
-		if (lines <= 0 || maxChars <= 0) return undefined;
-
-		const baseDir = join(homedir(), ".pi", "agent", "cache", "interactive-shell");
-		mkdirSync(baseDir, { recursive: true });
-
-		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-		const pid = this.session.pid;
-		const filename = `snapshot-${timestamp}-pid${pid}.log`;
-		const transcriptPath = join(baseDir, filename);
-
-		const tailResult = this.session.getTailLines({
-			lines,
-			ansi: this.config.ansiReemit,
-			maxChars,
-		});
-
-		const header = [
-			`# interactive-shell snapshot (${when})`,
-			`time: ${new Date().toISOString()}`,
-			`command: ${this.bgSession.command}`,
-			`pid: ${pid}`,
-			`exitCode: ${this.session.exitCode ?? ""}`,
-			`signal: ${this.session.signal ?? ""}`,
-			`lines: ${tailResult.lines.length} (requested ${lines}, maxChars ${maxChars})`,
-			"",
-		].join("\n");
-
-		writeFileSync(transcriptPath, header + tailResult.lines.join("\n") + "\n", { encoding: "utf-8" });
-
-		return { type: "snapshot", when, transcriptPath, linesWritten: tailResult.lines.length };
+		return maybeWriteHandoffSnapshot(this.session, when, this.config, { command: this.bgSession.command });
 	}
 
 	private finishAndClose(): void {
@@ -269,6 +213,11 @@ export class ReattachOverlay implements Component, Focusable {
 	handleInput(data: string): void {
 		if (this.state === "detach-dialog") {
 			this.handleDialogInput(data);
+			return;
+		}
+
+		if (matchesKey(data, this.config.focusShortcut)) {
+			this.onUnfocus?.();
 			return;
 		}
 
@@ -358,8 +307,10 @@ export class ReattachOverlay implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
+		width = Math.max(4, width);
 		const th = this.theme;
-		const border = (s: string) => th.fg("border", s);
+		const borderColor = this.focused ? "border" : "borderMuted";
+		const border = (s: string) => th.fg(borderColor, s);
 		const accent = (s: string) => th.fg("accent", s);
 		const dim = (s: string) => th.fg("dim", s);
 		const warning = (s: string) => th.fg("warning", s);
@@ -403,19 +354,21 @@ export class ReattachOverlay implements Component, Focusable {
 		const overlayHeight = Math.floor((this.tui.terminal.rows * this.config.overlayHeightPercent) / 100);
 		const footerHeight = this.state === "detach-dialog" ? FOOTER_LINES_DIALOG : FOOTER_LINES_COMPACT;
 		const chrome = HEADER_LINES + footerHeight + 2;
-		const termRows = Math.max(3, overlayHeight - chrome);
+		const termRows = Math.max(0, overlayHeight - chrome);
 
-		if (innerWidth !== this.lastWidth || termRows !== this.lastHeight) {
-			this.session.resize(innerWidth, termRows);
-			this.lastWidth = innerWidth;
-			this.lastHeight = termRows;
-			// After resize, ensure we're at the bottom to prevent flash to top
-			this.session.scrollToBottom();
-		}
+		if (termRows > 0) {
+			if (innerWidth !== this.lastWidth || termRows !== this.lastHeight) {
+				this.session.resize(innerWidth, termRows);
+				this.lastWidth = innerWidth;
+				this.lastHeight = termRows;
+				// After resize, ensure we're at the bottom to prevent flash to top
+				this.session.scrollToBottom();
+			}
 
-		const viewportLines = this.session.getViewportLines({ ansi: this.config.ansiReemit });
-		for (const line of viewportLines) {
-			lines.push(row(truncateToWidth(line, innerWidth, "")));
+			const viewportLines = this.session.getViewportLines({ ansi: this.config.ansiReemit });
+			for (const line of viewportLines) {
+				lines.push(row(truncateToWidth(line, innerWidth, "")));
+			}
 		}
 
 		if (this.session.isScrolledUp()) {
@@ -435,6 +388,7 @@ export class ReattachOverlay implements Component, Focusable {
 		}
 
 		const footerLines: string[] = [];
+		const focusHint = `${formatShortcut(this.config.focusShortcut)} ${this.focused ? "unfocus" : "focus shell"}`;
 
 		if (this.state === "detach-dialog") {
 			footerLines.push(row(accent("Session actions:")));
@@ -455,9 +409,11 @@ export class ReattachOverlay implements Component, Focusable {
 					? th.fg("success", "✓ Exited successfully")
 					: warning(`✗ Exited with code ${this.session.exitCode}`);
 			footerLines.push(row(exitMsg));
-			footerLines.push(row(dim(`Closing in ${this.exitCountdown}s... (any key to close)`)));
+			footerLines.push(row(dim(`Closing in ${this.exitCountdown}s... (any key to close) • ${focusHint}`)));
+		} else if (this.focused) {
+			footerLines.push(row(dim(`Ctrl+T transfer • Ctrl+B background • Ctrl+Q menu • Shift+Up/Down scroll • ${focusHint}`)));
 		} else {
-			footerLines.push(row(dim("Ctrl+T transfer • Ctrl+B background • Ctrl+Q menu • Shift+Up/Down scroll")));
+			footerLines.push(row(dim(focusHint)));
 		}
 
 		while (footerLines.length < footerHeight) {
@@ -479,6 +435,10 @@ export class ReattachOverlay implements Component, Focusable {
 		if (this.initialExitTimeout) {
 			clearTimeout(this.initialExitTimeout);
 			this.initialExitTimeout = null;
+		}
+		if (this.renderTimeout) {
+			clearTimeout(this.renderTimeout);
+			this.renderTimeout = null;
 		}
 		this.stopCountdown();
 		this.session.setEventHandlers({});

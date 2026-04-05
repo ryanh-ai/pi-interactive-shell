@@ -1,13 +1,18 @@
+import { stripVTControlCharacters } from "node:util";
 import type { PtyTerminalSession } from "./pty-session.js";
 import type { InteractiveShellConfig } from "./config.js";
 
+/** Runtime options for monitoring a headless dispatch session. */
 export interface HeadlessMonitorOptions {
 	autoExitOnQuiet: boolean;
 	quietThreshold: number;
 	gracePeriod?: number;
 	timeout?: number;
+	/** Original session start time in ms since epoch, preserved when a foreground session moves headless. */
+	startedAt?: number;
 }
 
+/** Completion payload emitted when a headless dispatch session finishes. */
 export interface HeadlessCompletionInfo {
 	exitCode: number | null;
 	signal?: number;
@@ -21,7 +26,7 @@ export interface HeadlessCompletionInfo {
 }
 
 export class HeadlessDispatchMonitor {
-	readonly startTime = Date.now();
+	readonly startTime: number;
 	private _disposed = false;
 	private quietTimer: ReturnType<typeof setTimeout> | null = null;
 	private timeoutTimer: ReturnType<typeof setTimeout> | null = null;
@@ -38,7 +43,12 @@ export class HeadlessDispatchMonitor {
 		private options: HeadlessMonitorOptions,
 		private onComplete: (info: HeadlessCompletionInfo) => void,
 	) {
+		this.startTime = options.startedAt ?? Date.now();
 		this.subscribe();
+
+		if (options.autoExitOnQuiet) {
+			this.resetQuietTimer();
+		}
 
 		if (options.timeout && options.timeout > 0) {
 			this.timeoutTimer = setTimeout(() => {
@@ -57,9 +67,12 @@ export class HeadlessDispatchMonitor {
 
 	private subscribe(): void {
 		this.unsubscribe();
-		this.unsubData = this.session.addDataListener(() => {
+		this.unsubData = this.session.addDataListener((data) => {
 			if (this.options.autoExitOnQuiet) {
-				this.resetQuietTimer();
+				const visible = stripVTControlCharacters(data);
+				if (visible.trim().length > 0) {
+					this.resetQuietTimer();
+				}
 			}
 		});
 		this.unsubExit = this.session.addExitListener((exitCode, signal) => {
@@ -112,6 +125,7 @@ export class HeadlessDispatchMonitor {
 				truncated: result.lines.length < result.totalLinesInBuffer || result.truncatedByChars,
 			};
 		} catch {
+			// Session terminal may already be disposed during completion — safe to return empty
 			return { lines: [], totalLines: 0, truncated: false };
 		}
 	}
@@ -162,7 +176,11 @@ export class HeadlessDispatchMonitor {
 
 	private triggerCompleteCallbacks(): void {
 		for (const cb of this.completeCallbacks) {
-			try { cb(); } catch { /* ignore */ }
+			try {
+				cb();
+			} catch (error) {
+				console.error("interactive-shell: headless completion callback error:", error);
+			}
 		}
 		this.completeCallbacks = [];
 	}

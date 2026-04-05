@@ -4,12 +4,143 @@ All notable changes to the `pi-interactive-shell` extension will be documented i
 
 ## [Unreleased]
 
+## [0.10.7] - 2026-04-04
+
 ### Added
-- `examples/skills/codex-5.3-prompting/` skill with GPT-5.3-Codex prompting guide -- self-contained best practices for verbosity control, scope discipline, forced upfront reading, plan mode, mid-task steering, context management, and reasoning effort recommendations.
+- Prompt-bearing monitored spawn for `/spawn`, so users can launch delegated hands-free or dispatch sessions like `/spawn claude "review the diffs" --dispatch` without dropping down to raw tool calls.
+- Native startup prompt support on structured `interactive_shell` spawn params via `spawn.prompt` for Pi, Codex, and Claude.
 
 ### Changed
+- `/spawn` now parses quoted positional prompt text plus `--hands-free` or `--dispatch`, while plain `/spawn` remains an interactive overlay launch.
+- README and tool docs now spell out that `/spawn` and structured `spawn` share the same resolver semantics, and that `Ctrl+G` only applies after taking over a genuinely monitored session.
+- README now includes a dedicated prompt-bearing `/spawn` subsection so the interactive vs monitored split is easier to find.
+
+## [0.10.6] - 2026-04-04
+
+### Added
+- Multi-agent spawn support for `pi`, Codex CLI, and Claude Code. `/spawn` can now launch the configured default agent, accept explicit agent overrides like `/spawn codex`, and support `--worktree` for spawning into a separate git worktree.
+- First-class `spawn` params on the `interactive_shell` tool so the agent can use the same spawn abstraction directly instead of building raw command strings by hand.
+- Regression coverage for dispatch background recovery when a backgrounded session cannot be looked up after overlay teardown.
+
+### Changed
+- Spawn config now lives under a nested `spawn` object with `defaultAgent`, `shortcut`, `commands`, `defaultArgs`, `worktree`, and `worktreeBaseDir`.
+- The spawn shortcut now launches the configured default spawn agent instead of always launching Pi.
+- Pi-only fork validation is shared between `/spawn` and the `interactive_shell` tool, so `fork` now fails fast with a clear error for Codex and Claude.
+- README and tool schema examples now document structured spawn usage, multi-agent `/spawn` commands, and worktree settings.
+
+### Fixed
+- Pi fork now validates the persisted source session before creating a worktree, so failed fork attempts no longer leave stray worktrees behind.
+- Dispatch background recovery now releases the source session and disposes stale monitor state if the expected background session entry is missing after handoff.
+- Generated worktree paths now include enough uniqueness to avoid collisions during rapid repeated spawns.
+
+## [0.10.5] - 2026-04-04
+
+### Added
+- `spawnShortcut` config setting for the fresh-session overlay shortcut. Defaults to `alt+shift+p` and is pinned at startup like `focusShortcut`, so changes apply on reload or restart.
+
+### Changed
+- Fresh-session shortcut registration now reads from config at startup instead of a hardcoded constant, so custom `spawnShortcut` values are applied consistently.
+- Docs and config parity tests now cover `spawnShortcut` defaults and README alignment.
+
+### Fixed
+- Overlay row/header rendering now clamps metadata and row content at narrow widths, preventing visual overflow when focus badge + PID metadata are wider than the available space.
+
+## [0.10.4] - 2026-04-04
+
+### Fixed
+- Focus shortcut handling now uses a terminal input listener while the overlay is open, so the configured `focusShortcut` toggles focus/unfocus reliably even when editor-level shortcuts would not fire. The default shortcut is now `alt+shift+f` instead of `alt+\`` for better terminal compatibility on macOS and to avoid Pi keybinding conflicts.
+- Overlay shortcut interception now ignores raw key release and key repeat events, which prevents the focus toggle from firing twice on Kitty-enabled terminals and cancelling itself out.
+- Overlay focus state is now more obvious visually: the shell shows a persistent `SHELL FOCUSED` or `EDITOR FOCUSED` badge and switches to a stronger border treatment when focused.
+- `alt+/` side chat is blocked while `pi-interactive-shell` is open and shows a warning instead of opening on top of the shell overlay.
+
+## [0.10.3] - 2026-04-04
+
+### Changed
+- Added a `promptSnippet` for `interactive_shell` so Pi 0.59+ includes the tool in the default prompt tool list and keeps delegation guidance explicit (`dispatch` preferred by default).
+
+## [0.10.2] - 2026-04-04
+
+### Added
+- **Focus switching** — configurable `focusShortcut` (default `alt+shift+f`) toggles focus between overlay and main chat. Same shortcut inside the overlay unfocuses back. Overlay uses `nonCapturing` mode with handle-based focus control.
+- **`/spawn` command** — launch pi in an overlay with `/spawn` (fresh session) or `/spawn fork` (fork current session with platform-aware shell quoting).
+- **`Alt+Shift+P` shortcut** — quick-launch a fresh pi session overlay.
+- **Return-to-agent control** — after taking over a hands-free session, press `Ctrl+G` or select "Return control to agent" from the `Ctrl+Q` menu to resume agent monitoring. Re-registers session in streaming mode and restarts hands-free update timers.
+- **`agent-resumed` status** — new `HandsFreeUpdate.status` value emitted when the user returns control to the agent. Handled in both streaming and non-blocking notification paths.
+- **Transfer output from commands** — `Ctrl+T` transfer results from `/spawn` and `/attach` now flow back into the agent conversation via shared `emitTransferredOutput()` helper, matching the tool-call behavior.
+- **Per-session completion suppression** — `agentHandledCompletion` moved from a single flag to a `Set<string>` on the coordinator, so concurrent sessions can't interfere with each other's notification paths.
+- **Stale monitor cleanup** — `disposeStaleMonitor()` helper cleans up orphan headless monitors and their active-session registrations when a background session has already been removed.
+- **3 new test files** (10 tests): `spawn-command.test.ts` (fresh, fork, quoting, persist guard, transfer forwarding), `command-session-selection.test.ts` (IDs containing delimiters), `kill-session-suppression.test.ts` (conditional mark on incomplete/complete sessions).
+
+### Changed
+- `/attach` and `/dismiss` selection uses structured `{ id, label }` option mapping with `.find()` instead of parsing rendered label strings by delimiter. Session IDs containing ` - ` or ` (` no longer break selection.
+- Kill suppression is conditional on completion state — `markAgentHandledCompletion` only set when `session.getResult()` is not yet available, preventing leaked suppression tokens for already-completed sessions.
+- `spawn-helper.ts` uses inline ENOENT narrowing instead of single-use `getErrnoCode` helper.
+- Dynamic dialog footer height (`dialogOptions.length + 2`) in the overlay accommodates the variable return-to-agent option. Reattach overlay keeps the static `FOOTER_LINES_DIALOG` constant (always 4 options).
+- Flattened nested if/else in footer rendering for both overlay components.
+- `createOverlayUiOptions()` deduplicates overlay UI configuration across all call sites.
+- `runtime-coordinator.ts` manages overlay focus via `OverlayHandle` (focus, unfocus, set, clear).
+- Config parse errors now pass the full error object to `console.error` instead of `String(error)`.
+- Shutdown kill failure preserves slug reservation to prevent ID collision with potentially still-running sessions.
+- Removed legacy `session_switch` lifecycle setup and rely on immutable-session `session_start` reinitialization for background widget setup.
+
+### Fixed
+- Duplicate completion notifications on monitored attach + transfer (transfer now marks `agentHandledCompletion` before monitor fires).
+- Cancelled dispatch sessions reported as "completed" — now correctly reports "was killed".
+- Stale headless monitors leaked when the corresponding background session was already cleaned up.
+- Zombie active-session registrations left behind on stale monitor disposal.
+- PTY event handlers not reset on attach failure recovery, causing stale overlay callbacks on disposed components.
+
+## [0.10.1] - 2026-03-13
+
+### Fixed
+- **Skill name mismatch** - SKILL.md declared `name: interactive-shell` but pi expects it to match the parent directory `pi-interactive-shell`. Fixed skill name to match package name.
+
+## [0.10.0] - 2026-03-13
+
+### Added
+- **Test harness** - Added vitest with 20 tests covering session queries, key encoding, notification formatting, headless monitor lifecycle, session manager, config/docs parity, and module loading.
+- **`gpt-5-4-prompting` skill** - New bundled skill with GPT-5.4 prompting best practices for Codex workflows.
+
+### Changed
+- **Architecture refactor** - Extracted shared logic into focused modules for better maintainability:
+  - `session-query.ts` - Unified output/query logic (rate limiting, incremental, drain, offset modes)
+  - `notification-utils.ts` - Message formatting for dispatch/hands-free notifications
+  - `handoff-utils.ts` - Snapshot/preview capture on session exit/transfer
+  - `runtime-coordinator.ts` - Centralized overlay/monitor/widget state management
+  - `pty-log.ts` - Raw output trimming and line slicing
+  - `pty-protocol.ts` - DSR cursor position query handling
+  - `spawn-helper.ts` - macOS node-pty permission fix
+  - `background-widget.ts` - TUI widget for background sessions
+- README, `SKILL.md`, install output, and the packaged Codex workflow examples now tell the same story about dispatch being the recommended delegated mode, the current 8s quiet threshold / 15s grace-period defaults, and the bundled prompt-skill surface.
+- The Codex workflow docs now point at the packaged `gpt-5-4-prompting`, `codex-5-3-prompting`, and `codex-cli` skills instead of describing a runtime fetch of the old 5.2 prompting guide.
+- Example prompts and skill docs are aligned around `gpt-5.4` as the default Codex model, with `gpt-5.3-codex` remaining the explicit opt-in fallback.
+- Renamed `codex-5.3-prompting` → `codex-5-3-prompting` example skill (filesystem-friendly path).
+
+### Fixed
+- **Map iteration bug** - Fixed `disposeAllMonitors()` modifying Map during iteration, which could cause unpredictable behavior.
+- **Array iteration bug** - Fixed PTY listener notifications modifying arrays during iteration if a listener unsubscribed itself.
+- **Missing runtime dependency** - Added `@sinclair/typebox` to dependencies (was imported but not declared).
+- Documented the packaged prompt/skill onboarding path more clearly so users can either rely on the exported package metadata or copy the bundled examples into their own prompt and skill directories.
+
+## [0.9.0] - 2026-02-23
+
+### Added
+- `examples/skills/codex-5.3-prompting/` skill with GPT-5.3-Codex prompting guide -- self-contained best practices for verbosity control, scope discipline, forced upfront reading, plan mode, mid-task steering, context management, and reasoning effort recommendations.
+- **`interactive-shell:update` event** — All hands-free update callbacks now emit `pi.events.emit("interactive-shell:update", update)` with the full `HandsFreeUpdate` payload. Extensions can listen for quiet, exit, kill, and user-takeover events regardless of which code path started the session (blocking, non-blocking, or reattach).
+- **`triggerTurn` on terminal events** — Non-blocking hands-free sessions now send `pi.sendMessage` with `triggerTurn: true` when the session exits, is killed, or the user takes over. Periodic "running" updates emit only on the event bus (cheap for extensions) without waking the agent.
+
+### Fixed
+- **Quiet detection broken for TUI apps** — Ink-based CLIs (Claude Code, etc.) emit periodic ANSI-only PTY data (cursor blink, frame redraws) that reset the quiet timer on every event, preventing quiet detection from ever triggering. Now filters data through `stripVTControlCharacters` and only resets the quiet timer when there's visible content. Fixed in both the overlay (`overlay-component.ts`) and headless dispatch monitor (`headless-monitor.ts`). Also seeds the quiet timer at startup when `autoExitOnQuiet` is enabled, so sessions that never produce visible output still get killed after the grace period.
+- **Lifecycle guard decoupled from callback** — The overlay used `onHandsFreeUpdate` presence as a proxy for "blocking tool call" to decide whether to unregister sessions on completion. Wiring the callback in non-blocking paths (for event emission) would cause premature session cleanup. Introduced `streamingMode` flag to separate "has update callback" from "should unregister on completion," so non-blocking sessions stay queryable after the callback fires.
+- **`autoExitOnQuiet` broken in interval update mode** — The `onData` handler only reset the quiet timer in `on-quiet` mode, so `autoExitOnQuiet` never fired with `updateMode: "interval"`. Also, the interval timer's safety-net flush unconditionally stopped the quiet timer, preventing `autoExitOnQuiet` from firing if the interval flushed before the quiet threshold. Both fixed: data handler now resets the timer whenever `autoExitOnQuiet` is enabled regardless of update mode, and the interval flush restarts (rather than stops) the quiet timer when `autoExitOnQuiet` is active.
+- **RangeError on narrow terminals** — `render()` computed `width - 2` for border strings without a lower bound, causing `String.prototype.repeat()` to throw with negative counts when terminal width < 4. Clamped in both the main overlay and reattach overlay. Fixes #2.
+- **Hardcoded `~/.pi/agent` path** — Config loading, snapshot writing, and the install script all hardcoded `~/.pi/agent`, ignoring `PI_CODING_AGENT_DIR`. Now uses `getAgentDir()` from pi's API in all runtime paths and reads the env var in the install script. Fixes #1.
+
+### Changed
+- Default `handsFreeQuietThreshold` increased from 5000ms to 8000ms and `autoExitGracePeriod` reduced from 30000ms to 15000ms. Both remain adjustable per-call via `handsFree.quietThreshold` and `handsFree.gracePeriod`, and via config file.
 - Dispatch mode is now the recommended default for delegated Codex runs. Updated `README.md`, `SKILL.md`, `tool-schema.ts`, `examples/skills/codex-cli/SKILL.md`, and all three codex prompt templates to prefer `mode: "dispatch"` over hands-free for fire-and-forget delegations.
 - Rewrote `codex-5.3-prompting` skill from a descriptive model-behavior guide into a directive prompt-construction reference. Cut behavioral comparison, mid-task steering, and context management prose sections; reframed each prompt block with a one-line "include when X" directive so the agent knows what to inject and when.
+- Added "Backwards compatibility hedging" section to `codex-5.3-prompting` skill covering the "cutover" keyword trick -- GPT-5.3-Codex inserts compatibility shims and fallback code even when told not to; using "cutover" + "no backwards compatibility" + "do not preserve legacy code" produces cleaner breaks than vague "don't worry about backwards compatibility" phrasing.
 - Example prompts (`codex-implement-plan`, `codex-review-impl`, `codex-review-plan`) updated for GPT-5.3-Codex: load `codex-5.3-prompting` and `codex-cli` skills instead of fetching the 5.2 guide URL at runtime, added scope fencing instructions to counter 5.3's aggressive refactoring, added "don't ask clarifying questions" and "brief updates" constraints, strengthened `codex-review-plan` to force reading codebase files referenced in the plan and constrain edit scope.
 
 ## [0.8.2] - 2026-02-10

@@ -12,6 +12,8 @@ https://github.com/user-attachments/assets/76f56ecd-fc12-4d92-a01e-e6ae9ba65ff4
 interactive_shell({ command: 'vim config.yaml' })
 ```
 
+Important: the `interactive_shell({...})` snippets in this README are tool calls made by Pi (or extension/prompt authors). End users do not type these directly into chat. As a user, ask Pi to run something (for example: "run this in dispatch mode") or use `/spawn`, `/attach`, and `/dismiss` commands.
+
 ## Why
 
 Some tasks need interactive CLIs - editors, REPLs, database shells, long-running processes. Pi can launch them in an overlay where:
@@ -53,6 +55,22 @@ Three modes control how the agent engages with a session:
 
 ## Quick Start
 
+The examples below show agent-side tool calls. They are not chat commands for end users.
+
+### Structured Spawn
+
+For Pi, Codex, and Claude, the agent can use structured spawn params instead of building command strings by hand:
+
+```typescript
+interactive_shell({ spawn: { agent: "pi" }, mode: "interactive" })
+interactive_shell({ spawn: { agent: "codex" }, mode: "dispatch" })
+interactive_shell({ spawn: { agent: "claude", prompt: "Review the diffs" }, mode: "dispatch" })
+interactive_shell({ spawn: { agent: "claude", worktree: true }, mode: "hands-free" })
+interactive_shell({ spawn: { mode: "fork" }, mode: "interactive" }) // Pi-only
+```
+
+Structured `spawn` uses the same resolver and config defaults as the user-facing `/spawn` command. Raw `command` is still supported for arbitrary CLIs and custom launch strings.
+
 ### Interactive
 
 ```typescript
@@ -86,7 +104,7 @@ interactive_shell({ sessionId: "calm-reef", kill: true })
 // → { status: "killed", output: "..." }
 ```
 
-The overlay opens for the user to watch. The agent checks in periodically. User can type anything to take over control.
+The overlay opens for the user to watch. The agent checks in periodically. User can type anything to take over control. After taking over a monitored hands-free or dispatch session, press `Ctrl+G` to return control to the agent.
 
 ### Dispatch
 
@@ -115,9 +133,9 @@ Attach to review full output: interactive_shell({ attach: "calm-reef" })
 
 The notification includes a brief tail (last 5 lines) and a reattach instruction. The PTY is preserved for 5 minutes so the agent can attach to review full scrollback.
 
-Dispatch defaults `autoExitOnQuiet: true` — the session gets a 30s startup grace period, then is killed after output goes silent (5s by default), which signals completion for task-oriented subagents. Tune the grace period with `handsFree: { gracePeriod: 60000 }` or opt out entirely with `handsFree: { autoExitOnQuiet: false }`.
+Dispatch defaults `autoExitOnQuiet: true` — the session gets a 15s startup grace period, then is killed after output goes silent (8s by default), which signals completion for task-oriented subagents. Tune the grace period with `handsFree: { gracePeriod: 60000 }` or opt out entirely with `handsFree: { autoExitOnQuiet: false }`.
 
-The overlay still shows for the user, who can Ctrl+T to transfer output, Ctrl+B to background, take over by typing, or Ctrl+Q for more options.
+The overlay still shows for the user, who can Ctrl+T to transfer output, Ctrl+B to background, take over by typing, or Ctrl+Q for more options. `Ctrl+G` only becomes meaningful after the user has taken over a monitored hands-free or dispatch session.
 
 ### Background Dispatch (Headless)
 
@@ -151,7 +169,7 @@ interactive_shell({
 
 ### Auto-Exit on Quiet
 
-For fire-and-forget single-task delegations, enable auto-exit to kill the session after 5s of output silence:
+For fire-and-forget single-task delegations, enable auto-exit to kill the session after 8s of output silence:
 
 ```typescript
 interactive_shell({
@@ -161,7 +179,7 @@ interactive_shell({
 })
 ```
 
-A 30s startup grace period prevents the session from being killed before the subprocess has time to produce output. Customize it per-call with `gracePeriod`:
+A 15s startup grace period prevents the session from being killed before the subprocess has time to produce output. Customize it per-call with `gracePeriod`:
 
 ```typescript
 interactive_shell({
@@ -251,7 +269,17 @@ interactive_shell({ dismissBackground: true })               // all sessions
 interactive_shell({ dismissBackground: "calm-reef" })        // specific session
 ```
 
-User can also `/attach` or `/attach <id>` to reattach, and `/dismiss` or `/dismiss <id>` to clean up from the chat.
+User can also `/spawn` to launch the configured default spawn agent, `/spawn codex`, `/spawn claude`, `/spawn pi`, `/spawn fork`, or `/spawn pi fork`. Add `--worktree` to spawn in a separate git worktree, for example `/spawn codex --worktree` or `/spawn pi fork --worktree`. Plain `/spawn claude` stays a normal interactive overlay. `fork` is Pi-only. Worktrees are left in place and the overlay will tell you where they were created. `/attach` or `/attach <id>` reattaches, and `/dismiss` or `/dismiss <id>` cleans up from the chat. The keyboard spawn shortcut is separate from `/spawn` and uses `spawn.shortcut`.
+
+### Prompt-Bearing `/spawn`
+
+Quoted prompt text plus `--hands-free` or `--dispatch` turns `/spawn` into a monitored delegated run instead of a plain interactive overlay. This shares the same resolver and defaults as structured `interactive_shell({ spawn: ... })`. Plain `/spawn` stays interactive. `Ctrl+G` only applies after you take over one of these monitored sessions.
+
+```bash
+/spawn claude "review the diffs" --dispatch
+/spawn codex "fix the failing tests" --hands-free
+/spawn pi fork "continue from here" --dispatch
+```
 
 ## Keys
 
@@ -261,6 +289,9 @@ User can also `/attach` or `/attach <id>` to reattach, and `/dismiss` or `/dismi
 | Ctrl+B | Background session (dismiss overlay, keep running) |
 | Ctrl+Q | Session menu (transfer/background/kill/cancel) |
 | Shift+Up/Down | Scroll history |
+| Alt+Shift+F (default) | Toggle focus between overlay and main chat (`focusShortcut`) |
+| Ctrl+G | Return to agent monitoring (only after taking over a monitored hands-free or dispatch session) |
+| Alt+Shift+P (default) | Launch the configured default spawn agent (`spawn.shortcut`) |
 | Any key (hands-free) | Take over control |
 
 ## Config
@@ -269,10 +300,29 @@ Configuration files (project overrides global):
 - **Global:** `~/.pi/agent/interactive-shell.json`
 - **Project:** `.pi/interactive-shell.json`
 
+Shortcut settings are pinned at startup. If you change `focusShortcut` or `spawn.shortcut`, reload or restart Pi to apply them.
+
 ```json
 {
   "overlayWidthPercent": 95,
   "overlayHeightPercent": 60,
+  "focusShortcut": "alt+shift+f",
+  "spawn": {
+    "defaultAgent": "pi",
+    "shortcut": "alt+shift+p",
+    "commands": {
+      "pi": "pi",
+      "codex": "codex",
+      "claude": "claude"
+    },
+    "defaultArgs": {
+      "pi": [],
+      "codex": [],
+      "claude": []
+    },
+    "worktree": false,
+    "worktreeBaseDir": "../repo-worktrees"
+  },
   "scrollbackLines": 5000,
   "exitAutoCloseDelay": 10,
   "minQueryIntervalSeconds": 60,
@@ -282,8 +332,8 @@ Configuration files (project overrides global):
   "completionNotifyMaxChars": 5000,
   "handsFreeUpdateMode": "on-quiet",
   "handsFreeUpdateInterval": 60000,
-  "handsFreeQuietThreshold": 5000,
-  "autoExitGracePeriod": 30000,
+  "handsFreeQuietThreshold": 8000,
+  "autoExitGracePeriod": 15000,
   "handsFreeUpdateMaxChars": 1500,
   "handsFreeMaxTotalChars": 100000,
   "handoffPreviewEnabled": true,
@@ -298,6 +348,13 @@ Configuration files (project overrides global):
 |---------|---------|-------------|
 | `overlayWidthPercent` | 95 | Overlay width (10-100%) |
 | `overlayHeightPercent` | 60 | Overlay height (20-90%) |
+| `focusShortcut` | "alt+shift+f" | Toggle focus between overlay and main chat |
+| `spawn.defaultAgent` | "pi" | Configured default spawn agent for `/spawn`, the spawn shortcut, and agent-side structured spawn |
+| `spawn.shortcut` | "alt+shift+p" | Keyboard shortcut that launches the configured default spawn agent |
+| `spawn.commands.<agent>` | `pi` / `codex` / `claude` | Executable or path override per spawn agent |
+| `spawn.defaultArgs.<agent>` | `[]` | Extra default CLI args per spawn agent |
+| `spawn.worktree` | `false` | Launch spawns in a separate git worktree by default |
+| `spawn.worktreeBaseDir` | unset | Optional base directory for generated worktrees |
 | `scrollbackLines` | 5000 | Terminal scrollback buffer |
 | `exitAutoCloseDelay` | 10 | Seconds before auto-close after exit |
 | `minQueryIntervalSeconds` | 60 | Rate limit between agent queries |
@@ -306,8 +363,8 @@ Configuration files (project overrides global):
 | `completionNotifyLines` | 50 | Lines in dispatch completion notification (10-500) |
 | `completionNotifyMaxChars` | 5000 | Max chars in completion notification (1KB-50KB) |
 | `handsFreeUpdateMode` | "on-quiet" | "on-quiet" or "interval" |
-| `handsFreeQuietThreshold` | 5000 | Silence duration before update (ms) |
-| `autoExitGracePeriod` | 30000 | Startup grace before `autoExitOnQuiet` kill (ms) |
+| `handsFreeQuietThreshold` | 8000 | Silence duration before update (ms) |
+| `autoExitGracePeriod` | 15000 | Startup grace before `autoExitOnQuiet` kill (ms) |
 | `handsFreeUpdateInterval` | 60000 | Max interval between updates (ms) |
 | `handsFreeUpdateMaxChars` | 1500 | Max chars per update |
 | `handsFreeMaxTotalChars` | 100000 | Total char budget for updates |
@@ -331,7 +388,7 @@ Full PTY. The subprocess thinks it's in a real terminal.
 
 ## Example Workflow: Plan, Implement, Review
 
-The `examples/prompts/` directory includes three prompt templates that chain together into a complete development workflow using Codex CLI. Each template instructs pi to gather context, generate a tailored meta prompt based on the [Codex prompting guide](https://developers.openai.com/cookbook/examples/gpt-5/gpt-5-2_prompting_guide.md), and launch Codex in an interactive overlay.
+The `examples/prompts/` directory includes three prompt templates that chain together into a complete development workflow using Codex CLI. Each template now loads the bundled `gpt-5-4-prompting` skill by default, falls back to `codex-5-3-prompting` when the user explicitly asks for Codex 5.3, and launches Codex in an interactive overlay.
 
 ### The Pipeline
 
@@ -347,14 +404,22 @@ Write a plan
 
 ### Installing the Templates
 
-Copy the prompt templates and Codex CLI skill to your pi config:
+Install the package first so pi can discover the bundled prompt and skill directories via the package metadata:
+
+```bash
+pi install npm:pi-interactive-shell
+```
+
+If you want your own slash commands and local skill copies, copy the examples into your agent config:
 
 ```bash
 # Prompt templates (slash commands)
 cp ~/.pi/agent/extensions/interactive-shell/examples/prompts/*.md ~/.pi/agent/prompts/
 
-# Codex CLI skill (teaches pi how to use codex flags, sandbox caveats, etc.)
+# Skills used by the templates
 cp -r ~/.pi/agent/extensions/interactive-shell/examples/skills/codex-cli ~/.pi/agent/skills/
+cp -r ~/.pi/agent/extensions/interactive-shell/examples/skills/gpt-5-4-prompting ~/.pi/agent/skills/
+cp -r ~/.pi/agent/extensions/interactive-shell/examples/skills/codex-5-3-prompting ~/.pi/agent/skills/
 ```
 
 ### Usage
@@ -388,9 +453,9 @@ Say you have a plan at `docs/auth-redesign-plan.md`:
 
 These templates demonstrate a "meta-prompt generation" pattern:
 
-1. **Pi gathers context** — reads the plan, runs git diff, fetches the Codex prompting guide
-2. **Pi generates a calibrated prompt** — tailored to the specific plan/diff, following the guide's best practices
-3. **Pi launches Codex in the overlay** — with explicit flags (`-m gpt-5.3-codex -c model_reasoning_effort="high" -a never`) and hands off control
+1. **Pi gathers context** — reads the plan, runs git diff, and loads the local `gpt-5-4-prompting` or `codex-5-3-prompting` skill
+2. **Pi generates a calibrated prompt** — tailored to the specific plan/diff, following the selected skill's best practices
+3. **Pi launches Codex in the overlay** — defaulting to `-m gpt-5.4 -a never` and switching to `-m gpt-5.3-codex -a never` only when the user explicitly asks for Codex 5.3
 
 The user watches Codex work in the overlay and can take over anytime (type to intervene, Ctrl+T to transfer output back to pi, Ctrl+Q for options).
 

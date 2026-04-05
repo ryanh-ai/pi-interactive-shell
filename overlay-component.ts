@@ -1,6 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import type { Component, Focusable, TUI } from "@mariozechner/pi-tui";
 import { matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { Theme } from "@mariozechner/pi-coding-agent";
@@ -15,9 +13,11 @@ import {
 	type OverlayState,
 	HEADER_LINES,
 	FOOTER_LINES_COMPACT,
-	FOOTER_LINES_DIALOG,
 	formatDuration,
+	formatShortcut,
 } from "./types.js";
+import { captureCompletionOutput, captureTransferOutput, maybeBuildHandoffPreview, maybeWriteHandoffSnapshot } from "./handoff-utils.js";
+import { createSessionQueryState, getSessionOutput } from "./session-query.js";
 
 export class InteractiveShellOverlay implements Component, Focusable {
 	focused = false;
@@ -39,7 +39,7 @@ export class InteractiveShellOverlay implements Component, Focusable {
 	private userTookOver = false;
 	private handsFreeInterval: ReturnType<typeof setInterval> | null = null;
 	private handsFreeInitialTimeout: ReturnType<typeof setTimeout> | null = null;
-	private startTime = Date.now();
+	private startTime: number;
 	private sessionId: string | null = null;
 	private sessionUnregistered = false;
 	// Timeout
@@ -56,10 +56,7 @@ export class InteractiveShellOverlay implements Component, Focusable {
 	private hasUnsentData = false;
 	// Non-blocking mode: track status for agent queries
 	private completionResult: InteractiveShellResult | undefined;
-	// Rate limiting for queries
-	private lastQueryTime = 0;
-	// Incremental read position (for incremental: true queries)
-	private incrementalReadPosition = 0;
+	private queryState = createSessionQueryState();
 	// Completion callbacks for waiters
 	private completeCallbacks: Array<() => void> = [];
 	// Simple render throttle to reduce flicker
@@ -77,6 +74,7 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		this.options = options;
 		this.config = config;
 		this.done = done;
+		this.startTime = options.startedAt ?? Date.now();
 
 		const overlayWidth = Math.floor((tui.terminal.columns * this.config.overlayWidthPercent) / 100);
 		const overlayHeight = Math.floor((tui.terminal.rows * this.config.overlayHeightPercent) / 100);
@@ -84,11 +82,16 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		const rows = Math.max(3, overlayHeight - (HEADER_LINES + FOOTER_LINES_COMPACT + 2));
 
 		const ptyEvents = {
-			onData: () => {
+			onData: (data: string) => {
 				this.debouncedRender();
-				if (this.state === "hands-free" && this.updateMode === "on-quiet") {
-					this.hasUnsentData = true;
-					this.resetQuietTimer();
+				if (this.state === "hands-free" && (this.updateMode === "on-quiet" || this.options.autoExitOnQuiet)) {
+					const visible = stripVTControlCharacters(data);
+					if (visible.trim().length > 0) {
+						if (this.updateMode === "on-quiet") {
+							this.hasUnsentData = true;
+						}
+						this.resetQuietTimer();
+					}
 				}
 			},
 			onExit: () => {
@@ -203,136 +206,9 @@ export class InteractiveShellOverlay implements Component, Focusable {
 
 	// Public methods for non-blocking mode (agent queries)
 
-	// Default output limits per status query
-	private static readonly DEFAULT_STATUS_OUTPUT = 5 * 1024; // 5KB
-	private static readonly DEFAULT_STATUS_LINES = 20;
-	private static readonly MAX_STATUS_OUTPUT = 50 * 1024; // 50KB max
-	private static readonly MAX_STATUS_LINES = 200; // 200 lines max
-
 	/** Get rendered terminal output (last N lines, truncated if too large) */
 	getOutputSinceLastCheck(options: { skipRateLimit?: boolean; lines?: number; maxChars?: number; offset?: number; drain?: boolean; incremental?: boolean } | boolean = false): { output: string; truncated: boolean; totalBytes: number; totalLines?: number; hasMore?: boolean; rateLimited?: boolean; waitSeconds?: number } {
-		if (this.finished) {
-			if (this.completionResult?.completionOutput) {
-				const lines = this.completionResult.completionOutput.lines;
-				const output = lines.join("\n");
-				return {
-					output,
-					truncated: this.completionResult.completionOutput.truncated,
-					totalBytes: output.length,
-					totalLines: this.completionResult.completionOutput.totalLines,
-				};
-			}
-			return { output: "", truncated: false, totalBytes: 0 };
-		}
-
-		// Handle legacy boolean parameter
-		const opts = typeof options === "boolean" ? { skipRateLimit: options } : options;
-		const skipRateLimit = opts.skipRateLimit ?? false;
-		// Clamp lines and maxChars to valid ranges (1 to MAX)
-		const requestedLines = Math.max(1, Math.min(
-			opts.lines ?? InteractiveShellOverlay.DEFAULT_STATUS_LINES,
-			InteractiveShellOverlay.MAX_STATUS_LINES
-		));
-		const requestedMaxChars = Math.max(1, Math.min(
-			opts.maxChars ?? InteractiveShellOverlay.DEFAULT_STATUS_OUTPUT,
-			InteractiveShellOverlay.MAX_STATUS_OUTPUT
-		));
-
-		// Check rate limiting (unless skipped, e.g., for completed sessions)
-		if (!skipRateLimit) {
-			const now = Date.now();
-			const minIntervalMs = this.config.minQueryIntervalSeconds * 1000;
-			const elapsed = now - this.lastQueryTime;
-
-			if (this.lastQueryTime > 0 && elapsed < minIntervalMs) {
-				const waitSeconds = Math.ceil((minIntervalMs - elapsed) / 1000);
-				return {
-					output: "",
-					truncated: false,
-					totalBytes: 0,
-					rateLimited: true,
-					waitSeconds,
-				};
-			}
-
-			// Update last query time
-			this.lastQueryTime = now;
-		}
-
-		// Incremental mode: return next N lines agent hasn't seen yet
-		// Server tracks position - agent just keeps calling with incremental: true
-		if (opts.incremental) {
-			const result = this.session.getLogSlice({
-				offset: this.incrementalReadPosition,
-				limit: requestedLines,
-				stripAnsi: true,
-			});
-			// Use sliceLineCount directly - handles empty lines correctly
-			// (counting newlines in slice fails for empty lines like "")
-			const linesFromSlice = result.sliceLineCount;
-			// Apply maxChars limit (may truncate mid-line, but we still advance past it)
-			const truncatedByChars = result.slice.length > requestedMaxChars;
-			const output = truncatedByChars ? result.slice.slice(0, requestedMaxChars) : result.slice;
-			// Update position for next incremental read
-			this.incrementalReadPosition += linesFromSlice;
-			const hasMore = this.incrementalReadPosition < result.totalLines;
-			return {
-				output,
-				truncated: truncatedByChars,
-				totalBytes: output.length,
-				totalLines: result.totalLines,
-				hasMore,
-			};
-		}
-
-		// Drain mode: return only NEW output since last query (raw stream, not lines)
-		// This is more token-efficient than re-reading the tail each time
-		if (opts.drain) {
-			const newOutput = this.session.getRawStream({ sinceLast: true, stripAnsi: true });
-			// Truncate if exceeds maxChars
-			const truncated = newOutput.length > requestedMaxChars;
-			const output = truncated ? newOutput.slice(-requestedMaxChars) : newOutput;
-			return {
-				output,
-				truncated,
-				totalBytes: output.length,
-			};
-		}
-
-		// Offset mode: use getLogSlice for pagination through full output
-		if (opts.offset !== undefined) {
-			const result = this.session.getLogSlice({
-				offset: opts.offset,
-				limit: requestedLines,
-				stripAnsi: true,
-			});
-			// Apply maxChars limit
-			const truncatedByChars = result.slice.length > requestedMaxChars;
-			const output = truncatedByChars ? result.slice.slice(0, requestedMaxChars) : result.slice;
-			// Calculate hasMore based on whether there are more lines after this slice
-			const hasMore = (opts.offset + result.sliceLineCount) < result.totalLines;
-			return {
-				output,
-				truncated: truncatedByChars || result.sliceLineCount >= requestedLines,
-				totalBytes: output.length,
-				totalLines: result.totalLines,
-				hasMore,
-			};
-		}
-
-		// Default: Use rendered terminal output (tail)
-		// This gives clean, readable content without TUI animation garbage
-		const tailResult = this.session.getTailLines({
-			lines: requestedLines,
-			ansi: false,
-			maxChars: requestedMaxChars,
-		});
-
-		const output = tailResult.lines.join("\n");
-		const totalBytes = output.length;
-		const truncated = tailResult.lines.length >= requestedLines || tailResult.truncatedByChars;
-
-		return { output, truncated, totalBytes, totalLines: tailResult.totalLinesInBuffer };
+		return getSessionOutput(this.session, this.config, this.queryState, options, this.completionResult?.completionOutput);
 	}
 
 	/** Get current session status */
@@ -373,8 +249,8 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		for (const callback of this.completeCallbacks) {
 			try {
 				callback();
-			} catch {
-				// Ignore errors in callbacks
+			} catch (error) {
+				console.error("interactive-shell: completion callback error:", error);
 			}
 		}
 		this.completeCallbacks = [];
@@ -419,30 +295,39 @@ export class InteractiveShellOverlay implements Component, Focusable {
 	}
 
 	private startHandsFreeUpdates(): void {
-		// Send initial update after a short delay (let process start)
-		this.handsFreeInitialTimeout = setTimeout(() => {
-			this.handsFreeInitialTimeout = null;
-			if (this.state === "hands-free") {
-				this.emitHandsFreeUpdate();
-			}
-		}, 2000);
-
-		this.handsFreeInterval = setInterval(() => {
-			if (this.state === "hands-free") {
-				if (this.updateMode === "on-quiet") {
-					if (this.hasUnsentData && this.options.onHandsFreeUpdate) {
-						this.emitHandsFreeUpdate();
-						this.hasUnsentData = false;
-						this.stopQuietTimer();
-					}
-				} else {
+		if (this.options.onHandsFreeUpdate) {
+			// Send initial update after a short delay (let process start)
+			this.handsFreeInitialTimeout = setTimeout(() => {
+				this.handsFreeInitialTimeout = null;
+				if (this.state === "hands-free") {
 					this.emitHandsFreeUpdate();
 				}
-			}
-		}, this.currentUpdateInterval);
+			}, 2000);
+
+			this.handsFreeInterval = setInterval(() => {
+				if (this.state === "hands-free") {
+					if (this.updateMode === "on-quiet") {
+						if (this.hasUnsentData) {
+							this.emitHandsFreeUpdate();
+							this.hasUnsentData = false;
+							if (this.options.autoExitOnQuiet) {
+								this.resetQuietTimer();
+							} else {
+								this.stopQuietTimer();
+							}
+						}
+					} else {
+						this.emitHandsFreeUpdate();
+					}
+				}
+			}, this.currentUpdateInterval);
+		}
+
+		if (this.options.autoExitOnQuiet) {
+			this.resetQuietTimer();
+		}
 	}
 
-	/** Reset the quiet timer - called on each data event in on-quiet mode */
 	private resetQuietTimer(): void {
 		this.stopQuietTimer();
 		this.quietTimer = setTimeout(() => {
@@ -507,10 +392,14 @@ export class InteractiveShellOverlay implements Component, Focusable {
 			this.handsFreeInterval = setInterval(() => {
 				if (this.state === "hands-free") {
 					if (this.updateMode === "on-quiet") {
-						if (this.hasUnsentData && this.options.onHandsFreeUpdate) {
+						if (this.hasUnsentData) {
 							this.emitHandsFreeUpdate();
 							this.hasUnsentData = false;
-							this.stopQuietTimer();
+							if (this.options.autoExitOnQuiet) {
+								this.resetQuietTimer();
+							} else {
+								this.stopQuietTimer();
+							}
 						}
 					} else {
 						this.emitHandsFreeUpdate();
@@ -526,9 +415,7 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		if (clamped === this.currentQuietThreshold) return;
 		this.currentQuietThreshold = clamped;
 
-		// If a quiet timer is active, restart it with the new threshold
-		// Use resetQuietTimer to ensure autoExitOnQuiet logic is included
-		if (this.quietTimer && this.updateMode === "on-quiet") {
+		if (this.quietTimer) {
 			this.resetQuietTimer();
 		}
 	}
@@ -624,8 +511,6 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		this.state = "running";
 		this.userTookOver = true;
 
-		// Notify agent that user took over (streaming mode)
-		// In non-blocking mode, keep session registered so agent can query status
 		if (this.options.onHandsFreeUpdate) {
 			this.options.onHandsFreeUpdate({
 				status: "user-takeover",
@@ -637,103 +522,91 @@ export class InteractiveShellOverlay implements Component, Focusable {
 				totalCharsSent: this.totalCharsSent,
 				budgetExhausted: this.budgetExhausted,
 			});
-			// Unregister and release ID in streaming mode - agent got notified, won't query
+		}
+		// In streaming mode (blocking tool call), unregister now since the agent
+		// gets the result via tool return. Otherwise keep registered for queries.
+		if (this.options.streamingMode) {
 			this.unregisterActiveSession(true);
 		}
-		// In non-blocking mode (no onHandsFreeUpdate), keep session registered
-		// so agent can query and see "user-takeover" status
 
 		this.tui.requestRender();
 	}
 
+	private returnToHandsFree(): void {
+		if (!this.userTookOver || !this.sessionId || this.session.exited) return;
+
+		this.state = "hands-free";
+		this.userTookOver = false;
+
+		// Re-register if streaming mode previously released the session
+		if (this.sessionUnregistered) {
+			sessionManager.registerActive({
+				id: this.sessionId,
+				command: this.options.command,
+				reason: this.options.reason,
+				write: (data) => this.session.write(data),
+				kill: () => this.killSession(),
+				background: () => this.backgroundSession(),
+				getOutput: (options) => this.getOutputSinceLastCheck(options),
+				getStatus: () => this.getSessionStatus(),
+				getRuntime: () => this.getRuntime(),
+				getResult: () => this.getCompletionResult(),
+				setUpdateInterval: (intervalMs) => this.setUpdateInterval(intervalMs),
+				setQuietThreshold: (thresholdMs) => this.setQuietThreshold(thresholdMs),
+				onComplete: (callback) => this.registerCompleteCallback(callback),
+			});
+			this.sessionUnregistered = false;
+		}
+
+		if (this.options.onHandsFreeUpdate) {
+			this.options.onHandsFreeUpdate({
+				status: "agent-resumed",
+				sessionId: this.sessionId,
+				runtime: Date.now() - this.startTime,
+				tail: [],
+				tailTruncated: false,
+				totalCharsSent: this.totalCharsSent,
+				budgetExhausted: this.budgetExhausted,
+			});
+		}
+
+		this.startHandsFreeUpdates();
+		this.tui.requestRender();
+	}
+
+	private getDialogOptions(): Array<{ key: DialogChoice; label: string }> {
+		const options: Array<{ key: DialogChoice; label: string }> = [];
+		if (this.userTookOver && !this.session.exited) {
+			options.push({ key: "return-to-agent", label: "Return control to agent" });
+		}
+		options.push(
+			{ key: "transfer", label: "Transfer output to agent" },
+			{ key: "background", label: "Run in background" },
+			{ key: "kill", label: "Kill process" },
+			{ key: "cancel", label: "Cancel (return to session)" },
+		);
+		return options;
+	}
+
 	/** Capture output for dispatch completion notifications */
 	private captureCompletionOutput(): InteractiveShellResult["completionOutput"] {
-		const result = this.session.getTailLines({
-			lines: this.config.completionNotifyLines,
-			ansi: false,
-			maxChars: this.config.completionNotifyMaxChars,
-		});
-		return {
-			lines: result.lines,
-			totalLines: result.totalLinesInBuffer,
-			truncated: result.lines.length < result.totalLinesInBuffer || result.truncatedByChars,
-		};
+		return captureCompletionOutput(this.session, this.config);
 	}
 
 	/** Capture output for transfer action (Ctrl+T or dialog) */
 	private captureTransferOutput(): InteractiveShellResult["transferred"] {
-		const maxLines = this.config.transferLines;
-		const maxChars = this.config.transferMaxChars;
-
-		const result = this.session.getTailLines({
-			lines: maxLines,
-			ansi: false,
-			maxChars,
-		});
-
-		const truncated = result.lines.length < result.totalLinesInBuffer || result.truncatedByChars;
-
-		return {
-			lines: result.lines,
-			totalLines: result.totalLinesInBuffer,
-			truncated,
-		};
+		return captureTransferOutput(this.session, this.config);
 	}
 
 	private maybeBuildHandoffPreview(when: "exit" | "detach" | "kill" | "timeout" | "transfer"): InteractiveShellResult["handoffPreview"] | undefined {
-		const enabled = this.options.handoffPreviewEnabled ?? this.config.handoffPreviewEnabled;
-		if (!enabled) return undefined;
-
-		const lines = this.options.handoffPreviewLines ?? this.config.handoffPreviewLines;
-		const maxChars = this.options.handoffPreviewMaxChars ?? this.config.handoffPreviewMaxChars;
-		if (lines <= 0 || maxChars <= 0) return undefined;
-
-		const result = this.session.getTailLines({
-			lines,
-			ansi: false,
-			maxChars,
-		});
-
-		return { type: "tail", when, lines: result.lines };
+		return maybeBuildHandoffPreview(this.session, when, this.config, this.options);
 	}
 
 	private maybeWriteHandoffSnapshot(when: "exit" | "detach" | "kill" | "timeout" | "transfer"): InteractiveShellResult["handoff"] | undefined {
-		const enabled = this.options.handoffSnapshotEnabled ?? this.config.handoffSnapshotEnabled;
-		if (!enabled) return undefined;
-
-		const lines = this.options.handoffSnapshotLines ?? this.config.handoffSnapshotLines;
-		const maxChars = this.options.handoffSnapshotMaxChars ?? this.config.handoffSnapshotMaxChars;
-		if (lines <= 0 || maxChars <= 0) return undefined;
-
-		const baseDir = join(homedir(), ".pi", "agent", "cache", "interactive-shell");
-		mkdirSync(baseDir, { recursive: true });
-
-		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-		const pid = this.session.pid;
-		const filename = `snapshot-${timestamp}-pid${pid}.log`;
-		const transcriptPath = join(baseDir, filename);
-
-		const tailResult = this.session.getTailLines({
-			lines,
-			ansi: this.config.ansiReemit,
-			maxChars,
-		});
-
-		const header = [
-			`# interactive-shell snapshot (${when})`,
-			`time: ${new Date().toISOString()}`,
-			`command: ${this.options.command}`,
-			`cwd: ${this.options.cwd ?? ""}`,
-			`pid: ${pid}`,
-			`exitCode: ${this.session.exitCode ?? ""}`,
-			`signal: ${this.session.signal ?? ""}`,
-			`lines: ${tailResult.lines.length} (requested ${lines}, maxChars ${maxChars})`,
-			"",
-		].join("\n");
-
-		writeFileSync(transcriptPath, header + tailResult.lines.join("\n") + "\n", { encoding: "utf-8" });
-
-		return { type: "snapshot", when, transcriptPath, linesWritten: tailResult.lines.length };
+		return maybeWriteHandoffSnapshot(this.session, when, this.config, {
+			command: this.options.command,
+			cwd: this.options.cwd,
+		}, this.options);
 	}
 
 	private finishWithExit(): void {
@@ -761,10 +634,9 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		this.completionResult = result;
 		this.triggerCompleteCallbacks();
 
-		// In non-blocking mode (no onHandsFreeUpdate), keep session registered
-		// so agent can query completion result. Agent's query will unregister.
-		// In streaming mode, unregister now since agent got final update.
-		if (this.options.onHandsFreeUpdate) {
+		// In streaming mode (blocking tool call), unregister now since the agent
+		// gets the result via tool return. Otherwise keep registered for queries.
+		if (this.options.streamingMode) {
 			this.unregisterActiveSession(true);
 		}
 
@@ -785,7 +657,7 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		const handoffPreview = this.maybeBuildHandoffPreview("detach");
 		const handoff = this.maybeWriteHandoffSnapshot("detach");
 		const addOptions = this.sessionId
-			? { id: this.sessionId, noAutoCleanup: this.options.mode === "dispatch" }
+			? { id: this.sessionId, noAutoCleanup: this.options.mode === "dispatch", startedAt: new Date(this.startTime) }
 			: undefined;
 		const id = sessionManager.add(this.options.command, this.session, this.options.name, this.options.reason, addOptions);
 		const result: InteractiveShellResult = {
@@ -801,10 +673,9 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		this.completionResult = result;
 		this.triggerCompleteCallbacks();
 
-		// In non-blocking mode (no onHandsFreeUpdate), keep session registered
-		// so agent can query completion result. Agent's query will unregister.
-		// Use releaseId=false because the background session now owns the ID.
-		if (this.options.onHandsFreeUpdate) {
+		// In streaming mode (blocking tool call), unregister now since the agent
+		// gets the result via tool return. releaseId=false because background owns the ID.
+		if (this.options.streamingMode) {
 			this.unregisterActiveSession(false);
 		}
 
@@ -836,9 +707,9 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		this.completionResult = result;
 		this.triggerCompleteCallbacks();
 
-		// In non-blocking mode (no onHandsFreeUpdate), keep session registered
-		// so agent can query completion result. Agent's query will unregister.
-		if (this.options.onHandsFreeUpdate) {
+		// In streaming mode (blocking tool call), unregister now since the agent
+		// gets the result via tool return. Otherwise keep registered for queries.
+		if (this.options.streamingMode) {
 			this.unregisterActiveSession(true);
 		}
 
@@ -875,9 +746,9 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		this.completionResult = result;
 		this.triggerCompleteCallbacks();
 
-		// In non-blocking mode (no onHandsFreeUpdate), keep session registered
-		// so agent can query completion result. Agent's query will unregister.
-		if (this.options.onHandsFreeUpdate) {
+		// In streaming mode (blocking tool call), unregister now since the agent
+		// gets the result via tool return. Otherwise keep registered for queries.
+		if (this.options.streamingMode) {
 			this.unregisterActiveSession(true);
 		}
 
@@ -929,9 +800,9 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		this.completionResult = result;
 		this.triggerCompleteCallbacks();
 
-		// In non-blocking mode (no onHandsFreeUpdate), keep session registered
-		// so agent can query completion result. Agent's query will unregister.
-		if (this.options.onHandsFreeUpdate) {
+		// In streaming mode (blocking tool call), unregister now since the agent
+		// gets the result via tool return. Otherwise keep registered for queries.
+		if (this.options.streamingMode) {
 			this.unregisterActiveSession(true);
 		}
 
@@ -941,6 +812,17 @@ export class InteractiveShellOverlay implements Component, Focusable {
 	handleInput(data: string): void {
 		if (this.state === "detach-dialog") {
 			this.handleDialogInput(data);
+			return;
+		}
+
+		if (matchesKey(data, this.config.focusShortcut)) {
+			this.options.onUnfocus?.();
+			return;
+		}
+
+		// Ctrl+G: Return to agent monitoring (only active during takeover)
+		if (this.userTookOver && this.state === "running" && matchesKey(data, "ctrl+g")) {
+			this.returnToHandsFree();
 			return;
 		}
 
@@ -977,7 +859,7 @@ export class InteractiveShellOverlay implements Component, Focusable {
 				this.triggerUserTakeover();
 			}
 			this.state = "detach-dialog";
-			this.dialogSelection = "transfer";
+			this.dialogSelection = (this.userTookOver && !this.session.exited) ? "return-to-agent" : "transfer";
 			this.tui.requestRender();
 			return;
 		}
@@ -1011,17 +893,21 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		}
 
 		if (matchesKey(data, "up") || matchesKey(data, "down")) {
-			const options: DialogChoice[] = ["transfer", "background", "kill", "cancel"];
-			const currentIdx = options.indexOf(this.dialogSelection);
+			const options = this.getDialogOptions();
+			const keys = options.map(o => o.key);
+			const currentIdx = keys.indexOf(this.dialogSelection);
 			const direction = matchesKey(data, "up") ? -1 : 1;
-			const newIdx = (currentIdx + direction + options.length) % options.length;
-			this.dialogSelection = options[newIdx]!;
+			const newIdx = (currentIdx + direction + keys.length) % keys.length;
+			this.dialogSelection = keys[newIdx]!;
 			this.tui.requestRender();
 			return;
 		}
 
 		if (matchesKey(data, "enter")) {
 			switch (this.dialogSelection) {
+				case "return-to-agent":
+					this.returnToHandsFree();
+					break;
 				case "transfer":
 					this.finishWithTransfer();
 					break;
@@ -1040,8 +926,13 @@ export class InteractiveShellOverlay implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
+		width = Math.max(4, width);
 		const th = this.theme;
-		const border = (s: string) => th.fg("border", s);
+		const borderColor = this.focused ? "borderAccent" : "borderMuted";
+		const borderGlyphs = this.focused
+			? { topLeft: "╔", topRight: "╗", bottomLeft: "╚", bottomRight: "╝", horizontal: "═", vertical: "║", separatorLeft: "╠", separatorRight: "╣" }
+			: { topLeft: "╭", topRight: "╮", bottomLeft: "╰", bottomRight: "╯", horizontal: "─", vertical: "│", separatorLeft: "├", separatorRight: "┤" };
+		const border = (s: string) => th.fg(borderColor, s);
 		const accent = (s: string) => th.fg("accent", s);
 		const dim = (s: string) => th.fg("dim", s);
 		const warning = (s: string) => th.fg("warning", s);
@@ -1051,21 +942,32 @@ export class InteractiveShellOverlay implements Component, Focusable {
 			const vis = visibleWidth(s);
 			return s + " ".repeat(Math.max(0, w - vis));
 		};
-		const row = (content: string) => border("│ ") + pad(content, innerWidth) + border(" │");
+		const row = (content: string) => border(`${borderGlyphs.vertical} `) + pad(truncateToWidth(content, innerWidth, ""), innerWidth) + border(` ${borderGlyphs.vertical}`);
 		const emptyRow = () => row("");
 
 		const lines: string[] = [];
 
 		// Sanitize command: collapse newlines and whitespace to single spaces for display
 		const sanitizedCommand = this.options.command.replace(/\s+/g, " ").trim();
-		const title = truncateToWidth(sanitizedCommand, innerWidth - 20, "...");
-		const pid = `PID: ${this.session.pid}`;
-		lines.push(border("╭" + "─".repeat(width - 2) + "╮"));
+		const focusBadgeLabel = this.focused ? " SHELL FOCUSED " : " EDITOR FOCUSED ";
+		const compactFocusBadgeLabel = this.focused ? " SHELL " : " EDITOR ";
+		const makeFocusBadge = (label: string) => th.bg("selectedBg", th.bold(th.fg(this.focused ? "accent" : "muted", label)));
+		const pid = dim(`PID: ${this.session.pid}`);
+		let titleMeta = `${makeFocusBadge(focusBadgeLabel)} ${pid}`;
+		if (visibleWidth(titleMeta) > innerWidth - 4) {
+			titleMeta = `${makeFocusBadge(compactFocusBadgeLabel)} ${pid}`;
+		}
+		if (visibleWidth(titleMeta) > innerWidth - 2) {
+			titleMeta = makeFocusBadge(compactFocusBadgeLabel);
+		}
+		titleMeta = truncateToWidth(titleMeta, innerWidth, "");
+		const title = truncateToWidth(sanitizedCommand, Math.max(0, innerWidth - visibleWidth(titleMeta) - 1), "...");
+		lines.push(border(borderGlyphs.topLeft + borderGlyphs.horizontal.repeat(width - 2) + borderGlyphs.topRight));
 		lines.push(
 			row(
 				accent(title) +
-					" ".repeat(Math.max(1, innerWidth - visibleWidth(title) - pid.length)) +
-					dim(pid),
+					" ".repeat(Math.max(0, innerWidth - visibleWidth(title) - visibleWidth(titleMeta))) +
+					titleMeta,
 			),
 		);
 		let hint: string;
@@ -1076,61 +978,59 @@ export class InteractiveShellOverlay implements Component, Focusable {
 			hint = `🤖 Hands-free (${elapsed}) • Type anything to take over`;
 		} else if (this.userTookOver) {
 			hint = sanitizedReason
-				? `You took over • ${sanitizedReason} • Ctrl+B background`
-				: "You took over • Ctrl+B background";
+				? `You took over • Ctrl+G return to agent • ${sanitizedReason}`
+				: "You took over • Ctrl+G return to agent";
 		} else {
 			hint = sanitizedReason
 				? `Ctrl+B background • ${sanitizedReason}`
 				: "Ctrl+B background";
 		}
 		lines.push(row(dim(truncateToWidth(hint, innerWidth, "..."))));
-		lines.push(border("├" + "─".repeat(width - 2) + "┤"));
+		lines.push(border(borderGlyphs.separatorLeft + borderGlyphs.horizontal.repeat(width - 2) + borderGlyphs.separatorRight));
 
+		const dialogOptions = this.state === "detach-dialog" ? this.getDialogOptions() : [];
 		const overlayHeight = Math.floor((this.tui.terminal.rows * this.config.overlayHeightPercent) / 100);
-		const footerHeight = this.state === "detach-dialog" ? FOOTER_LINES_DIALOG : FOOTER_LINES_COMPACT;
+		const footerHeight = this.state === "detach-dialog" ? dialogOptions.length + 2 : FOOTER_LINES_COMPACT;
 		const chrome = HEADER_LINES + footerHeight + 2;
-		const termRows = Math.max(3, overlayHeight - chrome);
+		const termRows = Math.max(0, overlayHeight - chrome);
 
-		if (innerWidth !== this.lastWidth || termRows !== this.lastHeight) {
-			this.session.resize(innerWidth, termRows);
-			this.lastWidth = innerWidth;
-			this.lastHeight = termRows;
-			// After resize, ensure we're at the bottom to prevent flash to top
-			this.session.scrollToBottom();
-		}
+		if (termRows > 0) {
+			if (innerWidth !== this.lastWidth || termRows !== this.lastHeight) {
+				this.session.resize(innerWidth, termRows);
+				this.lastWidth = innerWidth;
+				this.lastHeight = termRows;
+				// After resize, ensure we're at the bottom to prevent flash to top
+				this.session.scrollToBottom();
+			}
 
-		const viewportLines = this.session.getViewportLines({ ansi: this.config.ansiReemit });
-		for (const line of viewportLines) {
-			lines.push(row(truncateToWidth(line, innerWidth, "")));
+			const viewportLines = this.session.getViewportLines({ ansi: this.config.ansiReemit });
+			for (const line of viewportLines) {
+				lines.push(row(truncateToWidth(line, innerWidth, "")));
+			}
 		}
 
 		if (this.session.isScrolledUp()) {
 			const hintText = "── ↑ scrolled (Shift+Down) ──";
 			const padLen = Math.max(0, Math.floor((width - 2 - visibleWidth(hintText)) / 2));
 			lines.push(
-				border("├") +
+				border(borderGlyphs.separatorLeft) +
 					dim(
 						" ".repeat(padLen) +
 							hintText +
 							" ".repeat(width - 2 - padLen - visibleWidth(hintText)),
 					) +
-					border("┤"),
+					border(borderGlyphs.separatorRight),
 			);
 		} else {
-			lines.push(border("├" + "─".repeat(width - 2) + "┤"));
+			lines.push(border(borderGlyphs.separatorLeft + borderGlyphs.horizontal.repeat(width - 2) + borderGlyphs.separatorRight));
 		}
 
 		const footerLines: string[] = [];
+		const focusHint = `${formatShortcut(this.config.focusShortcut)} ${this.focused ? "unfocus" : "focus shell"}`;
 
 		if (this.state === "detach-dialog") {
 			footerLines.push(row(accent("Session actions:")));
-			const opts: Array<{ key: DialogChoice; label: string }> = [
-				{ key: "transfer", label: "Transfer output to agent" },
-				{ key: "background", label: "Run in background" },
-				{ key: "kill", label: "Kill process" },
-				{ key: "cancel", label: "Cancel (return to session)" },
-			];
-			for (const opt of opts) {
+			for (const opt of dialogOptions) {
 				const sel = this.dialogSelection === opt.key;
 				footerLines.push(row((sel ? accent("▶ ") : "  ") + (sel ? accent(opt.label) : opt.label)));
 			}
@@ -1141,11 +1041,19 @@ export class InteractiveShellOverlay implements Component, Focusable {
 					? th.fg("success", "✓ Exited successfully")
 					: warning(`✗ Exited with code ${this.session.exitCode}`);
 			footerLines.push(row(exitMsg));
-			footerLines.push(row(dim(`Closing in ${this.exitCountdown}s... (any key to close)`)));
+			footerLines.push(row(dim(`Closing in ${this.exitCountdown}s... (any key to close) • ${focusHint}`)));
 		} else if (this.state === "hands-free") {
-			footerLines.push(row(dim("🤖 Agent controlling • Type to take over • Ctrl+T transfer • Ctrl+B background")));
+			if (this.focused) {
+				footerLines.push(row(dim(`🤖 Agent controlling • Type to take over • Ctrl+T transfer • Ctrl+B background • ${focusHint}`)));
+			} else {
+				footerLines.push(row(dim(`🤖 Agent controlling • ${focusHint}`)));
+			}
+		} else if (!this.focused) {
+			footerLines.push(row(dim(focusHint)));
+		} else if (this.userTookOver) {
+			footerLines.push(row(dim(`Ctrl+G agent • Ctrl+T transfer • Ctrl+B background • Ctrl+Q menu • ${focusHint}`)));
 		} else {
-			footerLines.push(row(dim("Ctrl+T transfer • Ctrl+B background • Ctrl+Q menu • Shift+Up/Down scroll")));
+			footerLines.push(row(dim(`Ctrl+T transfer • Ctrl+B background • Ctrl+Q menu • Shift+Up/Down scroll • ${focusHint}`)));
 		}
 
 		while (footerLines.length < footerHeight) {
@@ -1153,7 +1061,7 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		}
 		lines.push(...footerLines);
 
-		lines.push(border("╰" + "─".repeat(width - 2) + "╯"));
+		lines.push(border(borderGlyphs.bottomLeft + borderGlyphs.horizontal.repeat(width - 2) + borderGlyphs.bottomRight));
 
 		return lines;
 	}
@@ -1176,10 +1084,9 @@ export class InteractiveShellOverlay implements Component, Focusable {
 		if (!this.completionResult) {
 			this.session.kill();
 			this.session.dispose();
-			// Release ID since session is dead and agent can't query anymore
 			this.unregisterActiveSession(true);
-		} else if (this.options.onHandsFreeUpdate) {
-			// Streaming mode already delivered result, safe to unregister and release
+		} else if (this.options.streamingMode) {
+			// Streaming mode already delivered result via tool return, safe to clean up
 			this.unregisterActiveSession(true);
 		}
 		// Non-blocking mode with completion: keep registered so agent can query

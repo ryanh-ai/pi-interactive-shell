@@ -9,8 +9,19 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = join(__dirname, "..");
 
-const EXTENSION_DIR = join(homedir(), ".pi", "agent", "extensions", "interactive-shell");
-const SKILL_DIR = join(homedir(), ".pi", "agent", "skills", "interactive-shell");
+function getAgentDir() {
+	const envDir = process.env.PI_CODING_AGENT_DIR;
+	if (envDir) {
+		if (envDir === "~") return homedir();
+		if (envDir.startsWith("~/")) return homedir() + envDir.slice(1);
+		return envDir;
+	}
+	return join(homedir(), ".pi", "agent");
+}
+
+const agentDir = getAgentDir();
+const EXTENSION_DIR = join(agentDir, "extensions", "interactive-shell");
+const SKILL_DIR = join(agentDir, "skills", "interactive-shell");
 
 function log(msg) {
 	console.log(`[pi-interactive-shell] ${msg}`);
@@ -90,7 +101,11 @@ function main() {
 	log("Restart pi to load the extension.");
 	log("");
 	log("Usage:");
-	log('  interactive_shell({ command: \'pi "Fix all bugs"\', mode: "hands-free" })');
+	log('  interactive_shell({ command: \'pi "Fix all bugs"\', mode: "dispatch" })');
+	log("");
+	log("Bundled example prompts live under extensions/interactive-shell/examples/prompts/");
+	log("Bundled example skills live under extensions/interactive-shell/examples/skills/");
+	log("Copy them into your prompts/skills directories if you want local slash commands or skill copies.");
 	log("");
 }
 

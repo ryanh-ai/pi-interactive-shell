@@ -1,89 +1,25 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { isKeyRelease, isKeyRepeat, matchesKey } from "@mariozechner/pi-tui";
 import { InteractiveShellOverlay } from "./overlay-component.js";
 import { ReattachOverlay } from "./reattach-overlay.js";
 import { PtyTerminalSession } from "./pty-session.js";
-import type { InteractiveShellResult } from "./types.js";
-import { sessionManager, generateSessionId, releaseSessionId } from "./session-manager.js";
-import type { OutputOptions, OutputResult } from "./session-manager.js";
+import type { InteractiveShellResult, HandsFreeUpdate } from "./types.js";
+import { sessionManager, generateSessionId } from "./session-manager.js";
 import { loadConfig } from "./config.js";
 import type { InteractiveShellConfig } from "./config.js";
+import { parseSpawnArgs, resolveSpawn, type SpawnRequest } from "./spawn.js";
 import { translateInput } from "./key-encoding.js";
 import { TOOL_NAME, TOOL_LABEL, TOOL_DESCRIPTION, toolParameters, type ToolParams } from "./tool-schema.js";
 import { formatDuration, formatDurationMs } from "./types.js";
 import { HeadlessDispatchMonitor } from "./headless-monitor.js";
 import type { HeadlessCompletionInfo } from "./headless-monitor.js";
+import { setupBackgroundWidget } from "./background-widget.js";
+import { buildDispatchNotification, buildHandsFreeUpdateMessage, buildResultNotification, summarizeInteractiveResult } from "./notification-utils.js";
+import { createSessionQueryState, getSessionOutput } from "./session-query.js";
+import { InteractiveShellCoordinator } from "./runtime-coordinator.js";
 
-let overlayOpen = false;
-let agentHandledCompletion = false;
-const headlessMonitors = new Map<string, HeadlessDispatchMonitor>();
-
-function getHeadlessOutput(session: PtyTerminalSession, opts?: OutputOptions | boolean): OutputResult {
-	const options = typeof opts === "boolean" ? {} : (opts ?? {});
-	const lines = options.lines ?? 20;
-	const maxChars = options.maxChars ?? 5 * 1024;
-	try {
-		const result = session.getTailLines({ lines, ansi: false, maxChars });
-		const output = result.lines.join("\n");
-		return {
-			output,
-			truncated: result.lines.length < result.totalLinesInBuffer || result.truncatedByChars,
-			totalBytes: output.length,
-			totalLines: result.totalLinesInBuffer,
-		};
-	} catch {
-		return { output: "", truncated: false, totalBytes: 0 };
-	}
-}
-
-const BRIEF_TAIL_LINES = 5;
-
-function buildDispatchNotification(sessionId: string, info: HeadlessCompletionInfo, duration: string): string {
-	const parts: string[] = [];
-	if (info.timedOut) {
-		parts.push(`Session ${sessionId} timed out (${duration}).`);
-	} else if (info.cancelled) {
-		parts.push(`Session ${sessionId} completed (${duration}).`);
-	} else if (info.exitCode === 0) {
-		parts.push(`Session ${sessionId} completed successfully (${duration}).`);
-	} else {
-		parts.push(`Session ${sessionId} exited with code ${info.exitCode} (${duration}).`);
-	}
-	if (info.completionOutput && info.completionOutput.totalLines > 0) {
-		parts.push(` ${info.completionOutput.totalLines} lines of output.`);
-	}
-	if (info.completionOutput && info.completionOutput.lines.length > 0) {
-		const allLines = info.completionOutput.lines;
-		let end = allLines.length;
-		while (end > 0 && allLines[end - 1].trim() === "") end--;
-		const tail = allLines.slice(Math.max(0, end - BRIEF_TAIL_LINES), end);
-		if (tail.length > 0) {
-			parts.push(`\n\n${tail.join("\n")}`);
-		}
-	}
-	parts.push(`\n\nAttach to review full output: interactive_shell({ attach: "${sessionId}" })`);
-	return parts.join("");
-}
-
-function buildResultNotification(sessionId: string, result: InteractiveShellResult): string {
-	const parts: string[] = [];
-	if (result.timedOut) {
-		parts.push(`Session ${sessionId} timed out.`);
-	} else if (result.cancelled) {
-		parts.push(`Session ${sessionId} was killed.`);
-	} else if (result.exitCode === 0) {
-		parts.push(`Session ${sessionId} completed successfully.`);
-	} else {
-		parts.push(`Session ${sessionId} exited with code ${result.exitCode}.`);
-	}
-	if (result.completionOutput && result.completionOutput.lines.length > 0) {
-		const truncNote = result.completionOutput.truncated
-			? ` (truncated from ${result.completionOutput.totalLines} total lines)`
-			: "";
-		parts.push(`\nOutput (${result.completionOutput.lines.length} lines${truncNote}):\n\n${result.completionOutput.lines.join("\n")}`);
-	}
-	return parts.join("");
-}
+const coordinator = new InteractiveShellCoordinator();
+const SIDE_CHAT_SHORTCUT = "alt+/";
 
 function makeMonitorCompletionCallback(
 	pi: ExtensionAPI,
@@ -91,17 +27,20 @@ function makeMonitorCompletionCallback(
 	startTime: number,
 ): (info: HeadlessCompletionInfo) => void {
 	return (info) => {
-		const duration = formatDuration(Date.now() - startTime);
-		const content = buildDispatchNotification(id, info, duration);
-		pi.sendMessage({
-			customType: "interactive-shell-transfer",
-			content,
-			display: true,
-			details: { sessionId: id, duration, ...info },
-		}, { triggerTurn: true });
-		pi.events.emit("interactive-shell:transfer", { sessionId: id, ...info });
+		const wasAgentHandled = coordinator.consumeAgentHandledCompletion(id);
+		if (!wasAgentHandled) {
+			const duration = formatDuration(Date.now() - startTime);
+			const content = buildDispatchNotification(id, info, duration);
+			pi.sendMessage({
+				customType: "interactive-shell-transfer",
+				content,
+				display: true,
+				details: { sessionId: id, duration, ...info },
+			}, { triggerTurn: true });
+			pi.events.emit("interactive-shell:transfer", { sessionId: id, ...info });
+		}
 		sessionManager.unregisterActive(id, false);
-		headlessMonitors.delete(id);
+		coordinator.deleteMonitor(id);
 		sessionManager.scheduleCleanup(id, 5 * 60 * 1000);
 	};
 }
@@ -113,20 +52,24 @@ function registerHeadlessActive(
 	session: PtyTerminalSession,
 	monitor: HeadlessDispatchMonitor,
 	startTime: number,
+	config: InteractiveShellConfig,
 ): void {
+	const queryState = createSessionQueryState();
+	coordinator.setMonitor(id, monitor);
+	const getCompletionOutput = () => monitor.getResult()?.completionOutput;
+
 	sessionManager.registerActive({
 		id,
 		command,
 		reason,
 		write: (data) => session.write(data),
 		kill: () => {
-			monitor.dispose();
+			coordinator.disposeMonitor(id);
 			sessionManager.remove(id);
 			sessionManager.unregisterActive(id, true);
-			headlessMonitors.delete(id);
 		},
 		background: () => {},
-		getOutput: (opts) => getHeadlessOutput(session, opts),
+		getOutput: (opts) => getSessionOutput(session, config, queryState, opts, getCompletionOutput()),
 		getStatus: () => session.exited ? "exited" : "running",
 		getRuntime: () => Date.now() - startTime,
 		getResult: () => monitor.getResult(),
@@ -134,104 +77,448 @@ function registerHeadlessActive(
 	});
 }
 
-let bgWidgetCleanup: (() => void) | null = null;
-
-function setupBackgroundWidget(ctx: { ui: { setWidget: Function }; hasUI?: boolean }) {
-	if (!ctx.hasUI) return;
-
-	bgWidgetCleanup?.();
-
-	let durationTimer: ReturnType<typeof setInterval> | null = null;
-	let tuiRef: { requestRender: () => void } | null = null;
-
-	const requestRender = () => tuiRef?.requestRender();
-
-	const unsubscribe = sessionManager.onChange(() => {
-		manageDurationTimer();
-		requestRender();
-	});
-
-	function manageDurationTimer() {
-		const sessions = sessionManager.list();
-		const hasRunning = sessions.some((s) => !s.session.exited);
-		if (hasRunning && !durationTimer) {
-			durationTimer = setInterval(requestRender, 10_000);
-		} else if (!hasRunning && durationTimer) {
-			clearInterval(durationTimer);
-			durationTimer = null;
-		}
-	}
-
-	ctx.ui.setWidget(
-		"bg-sessions",
-		(tui: any, theme: any) => {
-			tuiRef = tui;
-			return {
-				render: (width: number) => {
-					const sessions = sessionManager.list();
-					if (sessions.length === 0) return [];
-					const cols = width || tui.terminal?.columns || 120;
-					const lines: string[] = [];
-					for (const s of sessions) {
-						const exited = s.session.exited;
-						const dot = exited ? theme.fg("dim", "○") : theme.fg("accent", "●");
-						const id = theme.fg("dim", s.id);
-						const cmd = s.command.replace(/\s+/g, " ").trim();
-						const truncCmd = cmd.length > 60 ? cmd.slice(0, 57) + "..." : cmd;
-						const reason = s.reason ? theme.fg("dim", ` · ${s.reason}`) : "";
-						const status = exited ? theme.fg("dim", "exited") : theme.fg("success", "running");
-						const duration = theme.fg("dim", formatDuration(Date.now() - s.startedAt.getTime()));
-						const oneLine = ` ${dot} ${id}  ${truncCmd}${reason}  ${status} ${duration}`;
-						if (visibleWidth(oneLine) <= cols) {
-							lines.push(oneLine);
-						} else {
-							lines.push(truncateToWidth(` ${dot} ${id}  ${cmd}`, cols, "…"));
-							lines.push(truncateToWidth(`   ${status} ${duration}${reason}`, cols, "…"));
-						}
-					}
-					return lines;
-				},
-				invalidate: () => {},
-			};
-		},
-		{ placement: "belowEditor" },
-	);
-
-	manageDurationTimer();
-
-	bgWidgetCleanup = () => {
-		unsubscribe();
-		if (durationTimer) {
-			clearInterval(durationTimer);
-			durationTimer = null;
-		}
-		ctx.ui.setWidget("bg-sessions", undefined);
-		bgWidgetCleanup = null;
+function makeNonBlockingUpdateHandler(pi: ExtensionAPI): (update: HandsFreeUpdate) => void {
+	return (update) => {
+		pi.events.emit("interactive-shell:update", update);
+		const message = buildHandsFreeUpdateMessage(update);
+		if (!message) return;
+		pi.sendMessage({
+			customType: "interactive-shell-update",
+			content: message.content,
+			display: true,
+			details: message.details,
+		}, { triggerTurn: true });
 	};
 }
 
+function emitTransferredOutput(
+	pi: ExtensionAPI,
+	result: InteractiveShellResult,
+	fallbackSessionId?: string,
+): void {
+	if (!result.transferred) return;
+	const sessionId = result.sessionId ?? fallbackSessionId;
+	const truncatedNote = result.transferred.truncated
+		? ` (truncated from ${result.transferred.totalLines} total lines)`
+		: "";
+	const prefix = sessionId
+		? `Session ${sessionId} output transferred`
+		: "Interactive shell output transferred";
+	const content = `${prefix} (${result.transferred.lines.length} lines${truncatedNote}):\n\n${result.transferred.lines.join("\n")}`;
+	pi.sendMessage({
+		customType: "interactive-shell-transfer",
+		content,
+		display: true,
+		details: {
+			sessionId,
+			transferred: result.transferred,
+			exitCode: result.exitCode,
+			signal: result.signal,
+		},
+	}, { triggerTurn: true });
+	pi.events.emit("interactive-shell:transfer", {
+		sessionId,
+		transferred: result.transferred,
+		exitCode: result.exitCode,
+		signal: result.signal,
+	});
+}
+
+function appendWorktreeNotice(text: string, worktreePath: string | undefined): string {
+	if (!worktreePath) return text;
+	return `${text}\nWorktree left in place: ${worktreePath}`;
+}
+
 export default function interactiveShellExtension(pi: ExtensionAPI) {
-	pi.on("session_start", (_event, ctx) => setupBackgroundWidget(ctx));
-	pi.on("session_switch", (_event, ctx) => setupBackgroundWidget(ctx));
+	const startupConfig = loadConfig(process.cwd());
+	let terminalInputCleanup: (() => void) | null = null;
+	const loadRuntimeConfig = (cwd: string): InteractiveShellConfig => {
+		const config = loadConfig(cwd);
+		return {
+			...config,
+			focusShortcut: startupConfig.focusShortcut,
+			spawn: {
+				...config.spawn,
+				shortcut: startupConfig.spawn.shortcut,
+			},
+		};
+	};
+	const disposeStaleMonitor = (id: string, monitor: HeadlessDispatchMonitor | undefined): void => {
+		if (!monitor || monitor.disposed) return;
+		coordinator.disposeMonitor(id);
+		sessionManager.unregisterActive(id, false);
+	};
+	const createOverlayUiOptions = (config: InteractiveShellConfig) => ({
+		overlay: true,
+		overlayOptions: {
+			width: `${config.overlayWidthPercent}%`,
+			maxHeight: `${config.overlayHeightPercent}%`,
+			anchor: "center",
+			margin: 1,
+			nonCapturing: true,
+		},
+		onHandle: (handle) => {
+			coordinator.setOverlayHandle(handle);
+			handle.focus();
+		},
+	});
+	const spawnOverlay = async (ctx: ExtensionContext, request?: SpawnRequest): Promise<void> => {
+		if (coordinator.isOverlayOpen()) {
+			ctx.ui.notify("An overlay is already open. Close it first.", "error");
+			return;
+		}
+
+		const config = loadRuntimeConfig(ctx.cwd);
+		const spawn = resolveSpawn(config, ctx.cwd, request, () => ctx.sessionManager.getSessionFile());
+		if (!spawn.ok) {
+			ctx.ui.notify(spawn.error, "error");
+			return;
+		}
+
+		if (!coordinator.beginOverlay()) {
+			ctx.ui.notify(appendWorktreeNotice("An overlay is already open. Close it first.", spawn.spawn.worktreePath), "error");
+			return;
+		}
+		try {
+			const result = await ctx.ui.custom<InteractiveShellResult>(
+				(tui, theme, _kb, done) =>
+					new InteractiveShellOverlay(tui, theme, {
+						command: spawn.spawn.command,
+						cwd: spawn.spawn.cwd,
+						reason: spawn.spawn.reason,
+						onUnfocus: () => coordinator.unfocusOverlay(),
+					}, config, done),
+				createOverlayUiOptions(config),
+			);
+			if (spawn.spawn.worktreePath) {
+				ctx.ui.notify(`Worktree left in place: ${spawn.spawn.worktreePath}`, "info");
+			}
+			emitTransferredOutput(pi, result);
+		} finally {
+			coordinator.endOverlay();
+		}
+	};
+	const startNewSession = async (params: {
+		ctx: Pick<ExtensionContext, "ui" | "cwd" | "sessionManager"> & { hasUI?: boolean };
+		command?: string;
+		spawn?: SpawnRequest;
+		cwd?: string;
+		name?: string;
+		reason?: string;
+		mode?: "interactive" | "hands-free" | "dispatch";
+		background?: boolean;
+		handsFree?: ToolParams["handsFree"];
+		handoffPreview?: ToolParams["handoffPreview"];
+		handoffSnapshot?: ToolParams["handoffSnapshot"];
+		timeout?: number;
+		onUpdate?: (update: { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }) => void;
+	}): Promise<{ content: Array<{ type: "text"; text: string }>; details?: any; isError?: boolean }> => {
+		const { ctx, command, spawn, cwd, name, reason, mode, background, handsFree, handoffPreview, handoffSnapshot, timeout, onUpdate } = params;
+		if (!command && !spawn) {
+			return {
+				content: [{ type: "text", text: "One of 'command' or 'spawn' is required." }],
+				isError: true,
+			};
+		}
+
+		let effectiveCwd = cwd ?? ctx.cwd;
+		const config = loadRuntimeConfig(effectiveCwd);
+		const isNonBlocking = mode === "hands-free" || mode === "dispatch";
+		const hasUI = ctx.hasUI !== false;
+
+		if (background && mode !== "dispatch") {
+			return {
+				content: [{ type: "text", text: "background: true requires mode='dispatch' for new sessions." }],
+				isError: true,
+			};
+		}
+		if (!(mode === "dispatch" && background)) {
+			if (!hasUI) {
+				return {
+					content: [{ type: "text", text: "Interactive shell requires interactive TUI mode" }],
+					isError: true,
+				};
+			}
+			if (coordinator.isOverlayOpen()) {
+				return {
+					content: [{ type: "text", text: "An interactive shell overlay is already open. Wait for it to close or kill the active session before starting a new one." }],
+					isError: true,
+					details: { error: "overlay_already_open" },
+				};
+			}
+		}
+
+		let effectiveCommand = command;
+		let effectiveReason = reason;
+		let spawnWorktreePath: string | undefined;
+		let spawnAgent: string | undefined;
+		let spawnMode: string | undefined;
+		if (spawn) {
+			const resolvedSpawn = resolveSpawn(config, effectiveCwd, spawn, () => ctx.sessionManager.getSessionFile());
+			if (!resolvedSpawn.ok) {
+				return {
+					content: [{ type: "text", text: resolvedSpawn.error }],
+					isError: true,
+				};
+			}
+			effectiveCommand = resolvedSpawn.spawn.command;
+			effectiveCwd = resolvedSpawn.spawn.cwd;
+			effectiveReason = effectiveReason
+				? `${effectiveReason} • ${resolvedSpawn.spawn.reason}`
+				: resolvedSpawn.spawn.reason;
+			spawnWorktreePath = resolvedSpawn.spawn.worktreePath;
+			spawnAgent = resolvedSpawn.spawn.agent;
+			spawnMode = resolvedSpawn.spawn.mode;
+		}
+		if (!effectiveCommand) {
+			return {
+				content: [{ type: "text", text: "Failed to resolve the command to launch." }],
+				isError: true,
+			};
+		}
+
+		if (mode === "dispatch" && background) {
+			const id = generateSessionId(name);
+			const session = new PtyTerminalSession(
+				{ command: effectiveCommand, cwd: effectiveCwd, cols: 120, rows: 40, scrollback: config.scrollbackLines },
+			);
+
+			const startTime = Date.now();
+			sessionManager.add(effectiveCommand, session, name, effectiveReason, { id, noAutoCleanup: true, startedAt: new Date(startTime) });
+
+			const monitor = new HeadlessDispatchMonitor(session, config, {
+				autoExitOnQuiet: handsFree?.autoExitOnQuiet !== false,
+				quietThreshold: handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
+				gracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
+				timeout,
+				startedAt: startTime,
+			}, makeMonitorCompletionCallback(pi, id, startTime));
+			registerHeadlessActive(id, effectiveCommand, effectiveReason, session, monitor, startTime, config);
+
+			return {
+				content: [{ type: "text", text: appendWorktreeNotice(`Session dispatched in background (id: ${id}).\nYou'll be notified when it completes. User can /attach ${id} to watch.`, spawnWorktreePath) }],
+				details: { sessionId: id, backgroundId: id, mode: "dispatch", background: true, spawnAgent, spawnMode, spawnWorktreePath },
+			};
+		}
+
+		const generatedSessionId = isNonBlocking ? generateSessionId(name) : undefined;
+		if (isNonBlocking && generatedSessionId) {
+			if (!coordinator.beginOverlay()) {
+				return {
+					content: [{ type: "text", text: appendWorktreeNotice("An interactive shell overlay is already open. Wait for it to close or kill the active session before starting a new one.", spawnWorktreePath) }],
+					isError: true,
+					details: { error: "overlay_already_open", spawnAgent, spawnMode, spawnWorktreePath },
+				};
+			}
+			const overlayStartTime = Date.now();
+
+			let overlayPromise: Promise<InteractiveShellResult>;
+			try {
+				overlayPromise = ctx.ui.custom<InteractiveShellResult>(
+					(tui, theme, _kb, done) =>
+						new InteractiveShellOverlay(tui, theme, {
+							command: effectiveCommand,
+							cwd: effectiveCwd,
+							name,
+							reason: effectiveReason,
+							mode,
+							sessionId: generatedSessionId,
+							startedAt: overlayStartTime,
+							handsFreeUpdateMode: handsFree?.updateMode,
+							handsFreeUpdateInterval: handsFree?.updateInterval,
+							handsFreeQuietThreshold: handsFree?.quietThreshold,
+							handsFreeUpdateMaxChars: handsFree?.updateMaxChars,
+							handsFreeMaxTotalChars: handsFree?.maxTotalChars,
+							autoExitOnQuiet: mode === "dispatch"
+								? handsFree?.autoExitOnQuiet !== false
+								: handsFree?.autoExitOnQuiet === true,
+							autoExitGracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
+							onUnfocus: () => coordinator.unfocusOverlay(),
+							onHandsFreeUpdate: mode === "hands-free"
+								? makeNonBlockingUpdateHandler(pi)
+								: undefined,
+							handoffPreviewEnabled: handoffPreview?.enabled,
+							handoffPreviewLines: handoffPreview?.lines,
+							handoffPreviewMaxChars: handoffPreview?.maxChars,
+							handoffSnapshotEnabled: handoffSnapshot?.enabled,
+							handoffSnapshotLines: handoffSnapshot?.lines,
+							handoffSnapshotMaxChars: handoffSnapshot?.maxChars,
+							timeout,
+						}, config, done),
+					createOverlayUiOptions(config),
+				);
+			} catch (error) {
+				coordinator.endOverlay();
+				throw error;
+			}
+
+			setupDispatchCompletion(pi, overlayPromise, config, {
+				id: generatedSessionId,
+				mode,
+				command: effectiveCommand,
+				reason: effectiveReason,
+				timeout,
+				handsFree,
+				overlayStartTime,
+			});
+
+			if (mode === "dispatch") {
+				return {
+					content: [{ type: "text", text: appendWorktreeNotice(`Session dispatched (id: ${generatedSessionId}).\nYou'll be notified when it completes.\nYou can still query with interactive_shell({ sessionId: "${generatedSessionId}" }) if needed.`, spawnWorktreePath) }],
+					details: { sessionId: generatedSessionId, status: "running", command: effectiveCommand, reason: effectiveReason, mode, spawnAgent, spawnMode, spawnWorktreePath },
+				};
+			}
+			return {
+				content: [{ type: "text", text: appendWorktreeNotice(`Session started: ${generatedSessionId}\nCommand: ${effectiveCommand}\n\nUse interactive_shell({ sessionId: "${generatedSessionId}" }) to check status/output.\nUse interactive_shell({ sessionId: "${generatedSessionId}", kill: true }) to end when done.`, spawnWorktreePath) }],
+				details: { sessionId: generatedSessionId, status: "running", command: effectiveCommand, reason: effectiveReason, spawnAgent, spawnMode, spawnWorktreePath },
+			};
+		}
+
+		if (!coordinator.beginOverlay()) {
+			return {
+				content: [{ type: "text", text: appendWorktreeNotice("An interactive shell overlay is already open. Wait for it to close or kill the active session before starting a new one.", spawnWorktreePath) }],
+				isError: true,
+				details: { error: "overlay_already_open", spawnAgent, spawnMode, spawnWorktreePath },
+			};
+		}
+		onUpdate?.({
+			content: [{ type: "text", text: appendWorktreeNotice(`Opening: ${effectiveCommand}`, spawnWorktreePath) }],
+			details: { exitCode: null, backgrounded: false, cancelled: false },
+		});
+
+		let result: InteractiveShellResult;
+		try {
+			result = await ctx.ui.custom<InteractiveShellResult>(
+				(tui, theme, _kb, done) =>
+					new InteractiveShellOverlay(tui, theme, {
+						command: effectiveCommand,
+						cwd: effectiveCwd,
+						name,
+						reason: effectiveReason,
+						mode,
+						sessionId: generatedSessionId,
+						handsFreeUpdateMode: handsFree?.updateMode,
+						handsFreeUpdateInterval: handsFree?.updateInterval,
+						handsFreeQuietThreshold: handsFree?.quietThreshold,
+						handsFreeUpdateMaxChars: handsFree?.updateMaxChars,
+						handsFreeMaxTotalChars: handsFree?.maxTotalChars,
+						autoExitOnQuiet: handsFree?.autoExitOnQuiet,
+						autoExitGracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
+						onUnfocus: () => coordinator.unfocusOverlay(),
+						streamingMode: mode === "hands-free",
+						onHandsFreeUpdate: mode === "hands-free"
+							? (update) => {
+								let statusText: string;
+								switch (update.status) {
+									case "user-takeover":
+										statusText = `User took over session ${update.sessionId}`;
+										break;
+									case "agent-resumed":
+										statusText = `Agent resumed monitoring session ${update.sessionId}`;
+										break;
+									case "exited":
+										statusText = `Session ${update.sessionId} exited`;
+										break;
+									case "killed":
+										statusText = `Session ${update.sessionId} killed`;
+										break;
+									default: {
+										const budgetInfo = update.budgetExhausted ? " [budget exhausted]" : "";
+										statusText = `Session ${update.sessionId} running (${formatDurationMs(update.runtime)})${budgetInfo}`;
+									}
+								}
+								const newOutput = update.status === "running" && update.tail.length > 0
+									? `\n\n${update.tail.join("\n")}`
+									: "";
+								onUpdate?.({
+									content: [{ type: "text", text: statusText + newOutput }],
+									details: {
+										status: update.status,
+										sessionId: update.sessionId,
+										runtime: update.runtime,
+										newChars: update.tail.join("\n").length,
+										totalCharsSent: update.totalCharsSent,
+										budgetExhausted: update.budgetExhausted,
+										userTookOver: update.userTookOver,
+									},
+								});
+								pi.events.emit("interactive-shell:update", update);
+							}
+							: undefined,
+						handoffPreviewEnabled: handoffPreview?.enabled,
+						handoffPreviewLines: handoffPreview?.lines,
+						handoffPreviewMaxChars: handoffPreview?.maxChars,
+						handoffSnapshotEnabled: handoffSnapshot?.enabled,
+						handoffSnapshotLines: handoffSnapshot?.lines,
+						handoffSnapshotMaxChars: handoffSnapshot?.maxChars,
+						timeout,
+					}, config, done),
+				createOverlayUiOptions(config),
+			);
+		} finally {
+			coordinator.endOverlay();
+		}
+
+		return {
+			content: [{ type: "text", text: appendWorktreeNotice(summarizeInteractiveResult(effectiveCommand, result, timeout, effectiveReason), spawnWorktreePath) }],
+			details: { ...result, spawnAgent, spawnMode, spawnWorktreePath },
+		};
+	};
+	pi.registerShortcut(startupConfig.focusShortcut, {
+		description: "Focus interactive shell overlay",
+		handler: () => {
+			coordinator.focusOverlay();
+		},
+	});
+	pi.registerShortcut(startupConfig.spawn.shortcut, {
+		description: "Spawn the configured default agent in a fresh interactive shell overlay",
+		handler: (ctx) => spawnOverlay(ctx),
+	});
+
+	pi.on("session_start", (_event, ctx) => {
+		coordinator.replaceBackgroundWidgetCleanup(setupBackgroundWidget(ctx, sessionManager));
+		terminalInputCleanup?.();
+		terminalInputCleanup = ctx.ui.onTerminalInput((data) => {
+			if (!coordinator.isOverlayOpen()) return undefined;
+			if (isKeyRelease(data) || isKeyRepeat(data)) {
+				return undefined;
+			}
+			if (matchesKey(data, startupConfig.focusShortcut)) {
+				if (coordinator.isOverlayFocused()) {
+					coordinator.unfocusOverlay();
+				} else {
+					coordinator.focusOverlay();
+				}
+				return { consume: true };
+			}
+			if (matchesKey(data, SIDE_CHAT_SHORTCUT)) {
+				ctx.ui.notify("Close pi-interactive-shell first.", "warning");
+				return { consume: true };
+			}
+			return undefined;
+		});
+	});
 
 	pi.on("session_shutdown", () => {
-		bgWidgetCleanup?.();
+		terminalInputCleanup?.();
+		terminalInputCleanup = null;
+		coordinator.clearBackgroundWidget();
 		sessionManager.killAll();
-		for (const [id, monitor] of headlessMonitors) {
-			monitor.dispose();
-			headlessMonitors.delete(id);
-		}
+		coordinator.disposeAllMonitors();
 	});
 
 	pi.registerTool({
 		name: TOOL_NAME,
 		label: TOOL_LABEL,
 		description: TOOL_DESCRIPTION,
+		promptSnippet:
+			"Use this only to delegate tasks to interactive CLI coding agents (pi/claude/gemini/codex/aider). Prefer mode='dispatch' for fire-and-forget delegations.",
 		parameters: toolParameters,
 
 		async execute(_toolCallId, params, _signal, onUpdate, ctx) {
 			const {
 				command,
+				spawn,
 				sessionId,
 				kill,
 				outputLines,
@@ -263,6 +550,19 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				? { text: input, keys: inputKeys, hex: inputHex, paste: inputPaste }
 				: input;
 
+			if (spawn && command) {
+				return {
+					content: [{ type: "text", text: "Use either 'command' or 'spawn', not both." }],
+					isError: true,
+				};
+			}
+			if (spawn && (sessionId || attach || listBackground || dismissBackground)) {
+				return {
+					content: [{ type: "text", text: "'spawn' is only valid when starting a new session." }],
+					isError: true,
+				};
+			}
+
 			// ── Branch 1: Interact with existing session ──
 			if (sessionId) {
 				const session = sessionManager.getActive(sessionId);
@@ -276,9 +576,9 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 
 				// Kill
 				if (kill) {
-					const hMonitor = headlessMonitors.get(sessionId);
-					if (!hMonitor || hMonitor.disposed) {
-						agentHandledCompletion = true;
+					const alreadyCompleted = Boolean(session.getResult());
+					if (!alreadyCompleted) {
+						coordinator.markAgentHandledCompletion(sessionId);
 					}
 					const { output, truncated, totalBytes, totalLines, hasMore } = session.getOutput({ skipRateLimit: true, lines: outputLines, maxChars: outputMaxChars, offset: outputOffset, drain, incremental });
 					const status = session.getStatus();
@@ -302,14 +602,14 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 							details: session.getResult(),
 						};
 					}
-					const bMonitor = headlessMonitors.get(sessionId);
+					const bMonitor = coordinator.getMonitor(sessionId);
 					if (!bMonitor || bMonitor.disposed) {
-						agentHandledCompletion = true;
+						coordinator.markAgentHandledCompletion(sessionId);
 					}
 					session.background();
 					const result = session.getResult();
 					if (!result || !result.backgrounded) {
-						agentHandledCompletion = false;
+						coordinator.consumeAgentHandledCompletion(sessionId);
 						return {
 							content: [{ type: "text", text: `Session ${sessionId} is already running in the background.` }],
 							details: { sessionId },
@@ -452,7 +752,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
-				if (overlayOpen) {
+				if (coordinator.isOverlayOpen()) {
 					return {
 						content: [{ type: "text", text: "An interactive shell overlay is already open." }],
 						isError: true,
@@ -460,59 +760,78 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 					};
 				}
 
+				const monitor = coordinator.getMonitor(attach);
 				const bgSession = sessionManager.take(attach);
 				if (!bgSession) {
+					disposeStaleMonitor(attach, monitor);
 					return {
 						content: [{ type: "text", text: `Background session not found: ${attach}` }],
 						isError: true,
 					};
 				}
 
-				const config = loadConfig(cwd ?? ctx.cwd);
+				const restoreAttachSession = () => {
+					bgSession.session.setEventHandlers({});
+					sessionManager.restore(bgSession, { noAutoCleanup: Boolean(monitor && !monitor.disposed) });
+					return {
+						releaseId: false,
+						disposeMonitor: false,
+					};
+				};
+				if (!coordinator.beginOverlay()) {
+					restoreAttachSession();
+					return {
+						content: [{ type: "text", text: "An interactive shell overlay is already open." }],
+						isError: true,
+						details: { error: "overlay_already_open" },
+					};
+				}
+
+				const config = loadRuntimeConfig(cwd ?? ctx.cwd);
 				const reattachSessionId = attach;
-				const monitor = headlessMonitors.get(attach);
-
 				const isNonBlocking = mode === "hands-free" || mode === "dispatch";
-
-				overlayOpen = true;
-				const attachStartTime = Date.now();
-				const overlayPromise = ctx.ui.custom<InteractiveShellResult>(
-					(tui, theme, _kb, done) =>
-						new InteractiveShellOverlay(tui, theme, {
-							command: bgSession.command,
-							existingSession: bgSession.session,
-							sessionId: reattachSessionId,
-							mode,
-							cwd: cwd ?? ctx.cwd,
-							name: bgSession.name,
-							reason: bgSession.reason ?? reason,
-							handsFreeUpdateMode: handsFree?.updateMode,
-							handsFreeUpdateInterval: handsFree?.updateInterval,
-							handsFreeQuietThreshold: handsFree?.quietThreshold,
-							handsFreeUpdateMaxChars: handsFree?.updateMaxChars,
-							handsFreeMaxTotalChars: handsFree?.maxTotalChars,
-							autoExitOnQuiet: mode === "dispatch"
-								? handsFree?.autoExitOnQuiet !== false
-								: handsFree?.autoExitOnQuiet === true,
-							autoExitGracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-							handoffPreviewEnabled: handoffPreview?.enabled,
-							handoffPreviewLines: handoffPreview?.lines,
-							handoffPreviewMaxChars: handoffPreview?.maxChars,
-							handoffSnapshotEnabled: handoffSnapshot?.enabled,
-							handoffSnapshotLines: handoffSnapshot?.lines,
-							handoffSnapshotMaxChars: handoffSnapshot?.maxChars,
-							timeout,
-						}, config, done),
-					{
-						overlay: true,
-						overlayOptions: {
-							width: `${config.overlayWidthPercent}%`,
-							maxHeight: `${config.overlayHeightPercent}%`,
-							anchor: "center",
-							margin: 1,
-						},
-					},
-				);
+				const attachStartTime = bgSession.startedAt.getTime();
+				let overlayPromise: Promise<InteractiveShellResult>;
+				try {
+					overlayPromise = ctx.ui.custom<InteractiveShellResult>(
+						(tui, theme, _kb, done) =>
+							new InteractiveShellOverlay(tui, theme, {
+								command: bgSession.command,
+								existingSession: bgSession.session,
+								sessionId: reattachSessionId,
+								mode,
+								cwd: cwd ?? ctx.cwd,
+								name: bgSession.name,
+								reason: bgSession.reason ?? reason,
+								startedAt: attachStartTime,
+								handsFreeUpdateMode: handsFree?.updateMode,
+								handsFreeUpdateInterval: handsFree?.updateInterval,
+								handsFreeQuietThreshold: handsFree?.quietThreshold,
+								handsFreeUpdateMaxChars: handsFree?.updateMaxChars,
+								handsFreeMaxTotalChars: handsFree?.maxTotalChars,
+								autoExitOnQuiet: mode === "dispatch"
+									? handsFree?.autoExitOnQuiet !== false
+									: handsFree?.autoExitOnQuiet === true,
+								autoExitGracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
+								onUnfocus: () => coordinator.unfocusOverlay(),
+								onHandsFreeUpdate: mode === "hands-free"
+									? makeNonBlockingUpdateHandler(pi)
+									: undefined,
+								handoffPreviewEnabled: handoffPreview?.enabled,
+								handoffPreviewLines: handoffPreview?.lines,
+								handoffPreviewMaxChars: handoffPreview?.maxChars,
+								handoffSnapshotEnabled: handoffSnapshot?.enabled,
+								handoffSnapshotLines: handoffSnapshot?.lines,
+								handoffSnapshotMaxChars: handoffSnapshot?.maxChars,
+								timeout,
+							}, config, done),
+						createOverlayUiOptions(config),
+					);
+				} catch (error) {
+					coordinator.endOverlay();
+					restoreAttachSession();
+					throw error;
+				}
 
 				if (isNonBlocking) {
 					setupDispatchCompletion(pi, overlayPromise, config, {
@@ -523,6 +842,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 						timeout,
 						handsFree,
 						overlayStartTime: attachStartTime,
+						onOverlayError: restoreAttachSession,
 					});
 					return {
 						content: [{ type: "text", text: mode === "dispatch"
@@ -532,39 +852,33 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 					};
 				}
 
-				// Blocking (interactive) attach
 				let result: InteractiveShellResult;
 				try {
 					result = await overlayPromise;
+				} catch (error) {
+					restoreAttachSession();
+					throw error;
 				} finally {
-					overlayOpen = false;
+					coordinator.endOverlay();
 				}
-				if (monitor) {
-					monitor.dispose();
-					headlessMonitors.delete(attach);
-					sessionManager.unregisterActive(attach, !result.backgrounded);
-				} else if (!result.backgrounded) {
-					releaseSessionId(attach);
+				if (monitor && !monitor.disposed) {
+					if (!result.backgrounded) {
+						monitor.handleExternalCompletion(result.exitCode, result.signal, result.completionOutput);
+						coordinator.deleteMonitor(attach);
+					} else {
+						const monitoredId = result.backgroundId ?? attach;
+						const monitoredSession = sessionManager.take(monitoredId);
+						if (monitoredSession) {
+							sessionManager.restore(monitoredSession, { noAutoCleanup: true });
+						}
+					}
+				} else if (result.backgrounded) {
+					sessionManager.restartAutoCleanup(attach);
+				} else {
+					sessionManager.scheduleCleanup(attach);
 				}
 
-				let summary: string;
-				if (result.transferred) {
-					const truncatedNote = result.transferred.truncated ? ` (truncated from ${result.transferred.totalLines} total lines)` : "";
-					summary = `Session output transferred (${result.transferred.lines.length} lines${truncatedNote}):\n\n${result.transferred.lines.join("\n")}`;
-				} else if (result.backgrounded) {
-					summary = `Session running in background (id: ${result.backgroundId}). User can reattach with /attach ${result.backgroundId}`;
-				} else if (result.cancelled) {
-					summary = "Session killed";
-				} else if (result.timedOut) {
-					summary = `Session killed after timeout (${timeout ?? "?"}ms)`;
-				} else {
-					const status = result.exitCode === 0 ? "successfully" : `with code ${result.exitCode}`;
-					summary = `Session ended ${status}`;
-				}
-				if (!result.transferred && result.handoffPreview?.type === "tail" && result.handoffPreview.lines.length > 0) {
-					summary += `\n\nOverlay tail (${result.handoffPreview.when}, last ${result.handoffPreview.lines.length} lines):\n${result.handoffPreview.lines.join("\n")}`;
-				}
-				return { content: [{ type: "text", text: summary }], details: result };
+				return { content: [{ type: "text", text: summarizeInteractiveResult(command ?? bgSession.command, result, timeout, bgSession.reason ?? reason) }], details: result };
 			}
 
 			// ── Branch 3: List background sessions ──
@@ -599,11 +913,7 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 				}
 
 				for (const tid of targetIds) {
-					const monitor = headlessMonitors.get(tid);
-					if (monitor) {
-						monitor.dispose();
-						headlessMonitors.delete(tid);
-					}
+					coordinator.disposeMonitor(tid);
 					sessionManager.unregisterActive(tid, false);
 					sessionManager.remove(tid);
 				}
@@ -615,245 +925,57 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			}
 
 			// ── Branch 4: Start new session ──
-			if (!command) {
+			if (!command && !spawn) {
 				return {
-					content: [{ type: "text", text: "One of 'command', 'sessionId', 'attach', 'listBackground', or 'dismissBackground' is required." }],
+					content: [{ type: "text", text: "One of 'command', 'spawn', 'sessionId', 'attach', 'listBackground', or 'dismissBackground' is required." }],
 					isError: true,
 				};
 			}
-
-			const effectiveCwd = cwd ?? ctx.cwd;
-			const config = loadConfig(effectiveCwd);
-			const isNonBlocking = mode === "hands-free" || mode === "dispatch";
-
-			// ── Branch 4a: Headless dispatch ──
-			if (mode === "dispatch" && background) {
-				const id = generateSessionId(name);
-				const session = new PtyTerminalSession(
-					{ command, cwd: effectiveCwd, cols: 120, rows: 40, scrollback: config.scrollbackLines },
-				);
-				sessionManager.add(command, session, name, reason, { id, noAutoCleanup: true });
-
-				const startTime = Date.now();
-				const monitor = new HeadlessDispatchMonitor(session, config, {
-					autoExitOnQuiet: handsFree?.autoExitOnQuiet !== false,
-					quietThreshold: handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
-					gracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-					timeout,
-				}, makeMonitorCompletionCallback(pi, id, startTime));
-				headlessMonitors.set(id, monitor);
-				registerHeadlessActive(id, command, reason, session, monitor, startTime);
-
-				return {
-					content: [{ type: "text", text: `Session dispatched in background (id: ${id}).\nYou'll be notified when it completes. User can /attach ${id} to watch.` }],
-					details: { sessionId: id, backgroundId: id, mode: "dispatch", background: true },
-				};
-			}
-
-			// Validate: background only valid with dispatch for new sessions
-			if (background) {
-				return {
-					content: [{ type: "text", text: "background: true requires mode='dispatch' for new sessions." }],
-					isError: true,
-				};
-			}
-
-			if (!ctx.hasUI) {
-				return {
-					content: [{ type: "text", text: "Interactive shell requires interactive TUI mode" }],
-					isError: true,
-				};
-			}
-
-			if (overlayOpen) {
-				return {
-					content: [{ type: "text", text: "An interactive shell overlay is already open. Wait for it to close or kill the active session before starting a new one." }],
-					isError: true,
-					details: { error: "overlay_already_open" },
-				};
-			}
-
-			const generatedSessionId = isNonBlocking ? generateSessionId(name) : undefined;
-
-			// ── Non-blocking path (hands-free or dispatch) ──
-			if (isNonBlocking && generatedSessionId) {
-				overlayOpen = true;
-				const overlayStartTime = Date.now();
-
-				const overlayPromise = ctx.ui.custom<InteractiveShellResult>(
-					(tui, theme, _kb, done) =>
-						new InteractiveShellOverlay(tui, theme, {
-							command,
-							cwd: effectiveCwd,
-							name,
-							reason,
-							mode,
-							sessionId: generatedSessionId,
-							handsFreeUpdateMode: handsFree?.updateMode,
-							handsFreeUpdateInterval: handsFree?.updateInterval,
-							handsFreeQuietThreshold: handsFree?.quietThreshold,
-							handsFreeUpdateMaxChars: handsFree?.updateMaxChars,
-							handsFreeMaxTotalChars: handsFree?.maxTotalChars,
-							autoExitOnQuiet: mode === "dispatch"
-								? handsFree?.autoExitOnQuiet !== false
-								: handsFree?.autoExitOnQuiet === true,
-							autoExitGracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-							handoffPreviewEnabled: handoffPreview?.enabled,
-							handoffPreviewLines: handoffPreview?.lines,
-							handoffPreviewMaxChars: handoffPreview?.maxChars,
-							handoffSnapshotEnabled: handoffSnapshot?.enabled,
-							handoffSnapshotLines: handoffSnapshot?.lines,
-							handoffSnapshotMaxChars: handoffSnapshot?.maxChars,
-							timeout,
-						}, config, done),
-					{
-						overlay: true,
-						overlayOptions: {
-							width: `${config.overlayWidthPercent}%`,
-							maxHeight: `${config.overlayHeightPercent}%`,
-							anchor: "center",
-							margin: 1,
-						},
-					},
-				);
-
-				setupDispatchCompletion(pi, overlayPromise, config, {
-					id: generatedSessionId,
-					mode: mode!,
-					command,
-					reason,
-					timeout,
-					handsFree,
-					overlayStartTime,
-				});
-
-				if (mode === "dispatch") {
-					return {
-						content: [{ type: "text", text: `Session dispatched (id: ${generatedSessionId}).\nYou'll be notified when it completes.\nYou can still query with interactive_shell({ sessionId: "${generatedSessionId}" }) if needed.` }],
-						details: { sessionId: generatedSessionId, status: "running", command, reason, mode },
-					};
-				}
-				return {
-					content: [{ type: "text", text: `Session started: ${generatedSessionId}\nCommand: ${command}\n\nUse interactive_shell({ sessionId: "${generatedSessionId}" }) to check status/output.\nUse interactive_shell({ sessionId: "${generatedSessionId}", kill: true }) to end when done.` }],
-					details: { sessionId: generatedSessionId, status: "running", command, reason },
-				};
-			}
-
-			// ── Blocking (interactive) path ──
-			overlayOpen = true;
-			onUpdate?.({
-				content: [{ type: "text", text: `Opening: ${command}` }],
-				details: { exitCode: null, backgrounded: false, cancelled: false },
+			return startNewSession({
+				ctx,
+				command,
+				spawn,
+				cwd,
+				name,
+				reason,
+				mode,
+				background,
+				handsFree,
+				handoffPreview,
+				handoffSnapshot,
+				timeout,
+				onUpdate,
 			});
+		},
+	});
 
-			let result: InteractiveShellResult;
-			try {
-				result = await ctx.ui.custom<InteractiveShellResult>(
-					(tui, theme, _kb, done) =>
-						new InteractiveShellOverlay(tui, theme, {
-							command,
-							cwd: effectiveCwd,
-							name,
-							reason,
-							mode,
-							sessionId: generatedSessionId,
-							handsFreeUpdateMode: handsFree?.updateMode,
-							handsFreeUpdateInterval: handsFree?.updateInterval,
-							handsFreeQuietThreshold: handsFree?.quietThreshold,
-							handsFreeUpdateMaxChars: handsFree?.updateMaxChars,
-							handsFreeMaxTotalChars: handsFree?.maxTotalChars,
-							autoExitOnQuiet: handsFree?.autoExitOnQuiet,
-							autoExitGracePeriod: handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-							onHandsFreeUpdate: mode === "hands-free"
-								? (update) => {
-									let statusText: string;
-									switch (update.status) {
-										case "user-takeover":
-											statusText = `User took over session ${update.sessionId}`;
-											break;
-										case "exited":
-											statusText = `Session ${update.sessionId} exited`;
-											break;
-										default: {
-											const budgetInfo = update.budgetExhausted ? " [budget exhausted]" : "";
-											statusText = `Session ${update.sessionId} running (${formatDurationMs(update.runtime)})${budgetInfo}`;
-										}
-									}
-									const newOutput = update.status === "running" && update.tail.length > 0
-										? `\n\n${update.tail.join("\n")}`
-										: "";
-									onUpdate?.({
-										content: [{ type: "text", text: statusText + newOutput }],
-										details: {
-											status: update.status,
-											sessionId: update.sessionId,
-											runtime: update.runtime,
-											newChars: update.tail.join("\n").length,
-											totalCharsSent: update.totalCharsSent,
-											budgetExhausted: update.budgetExhausted,
-											userTookOver: update.userTookOver,
-										},
-									});
-								}
-								: undefined,
-							handoffPreviewEnabled: handoffPreview?.enabled,
-							handoffPreviewLines: handoffPreview?.lines,
-							handoffPreviewMaxChars: handoffPreview?.maxChars,
-							handoffSnapshotEnabled: handoffSnapshot?.enabled,
-							handoffSnapshotLines: handoffSnapshot?.lines,
-							handoffSnapshotMaxChars: handoffSnapshot?.maxChars,
-							timeout,
-						}, config, done),
-					{
-						overlay: true,
-						overlayOptions: {
-							width: `${config.overlayWidthPercent}%`,
-							maxHeight: `${config.overlayHeightPercent}%`,
-							anchor: "center",
-							margin: 1,
-						},
-					},
-				);
-			} finally {
-				overlayOpen = false;
+	pi.registerCommand("spawn", {
+		description: "Spawn the configured default agent, pi, codex, or claude in an interactive shell overlay",
+		handler: async (args, ctx) => {
+			const parsed = parseSpawnArgs(args);
+			if (!parsed.ok) {
+				ctx.ui.notify(`${parsed.error}\nUsage: /spawn [pi|codex|claude] [fresh|fork] [--worktree] [\"prompt\" --hands-free|--dispatch]`, "error");
+				return;
 			}
-
-			let summary: string;
-			if (result.transferred) {
-				const truncatedNote = result.transferred.truncated ? ` (truncated from ${result.transferred.totalLines} total lines)` : "";
-				summary = `Session output transferred (${result.transferred.lines.length} lines${truncatedNote}):\n\n${result.transferred.lines.join("\n")}`;
-			} else if (result.backgrounded) {
-				summary = `Session running in background (id: ${result.backgroundId}). User can reattach with /attach ${result.backgroundId}`;
-			} else if (result.cancelled) {
-				summary = "User killed the interactive session";
-			} else if (result.timedOut) {
-				summary = `Session killed after timeout (${timeout ?? "?"}ms)`;
-			} else {
-				const status = result.exitCode === 0 ? "successfully" : `with code ${result.exitCode}`;
-				summary = `Session ended ${status}`;
+			if (parsed.parsed.monitorMode) {
+				const result = await startNewSession({
+					ctx,
+					spawn: parsed.parsed.request,
+					mode: parsed.parsed.monitorMode,
+				});
+				if (result.isError) {
+					ctx.ui.notify(result.content[0]?.text ?? "Failed to start session.", "error");
+				}
+				return;
 			}
-
-			if (result.userTookOver) {
-				summary += "\n\nNote: User took over control during hands-free mode.";
-			}
-
-			const warning = buildIdlePromptWarning(command, reason);
-			if (warning) {
-				summary += `\n\n${warning}`;
-			}
-
-			if (!result.transferred && result.handoffPreview?.type === "tail" && result.handoffPreview.lines.length > 0) {
-				summary += `\n\nOverlay tail (${result.handoffPreview.when}, last ${result.handoffPreview.lines.length} lines):\n${result.handoffPreview.lines.join("\n")}`;
-			}
-
-			return { content: [{ type: "text", text: summary }], details: result };
+			await spawnOverlay(ctx, parsed.parsed.request);
 		},
 	});
 
 	pi.registerCommand("attach", {
 		description: "Reattach to a background shell session",
 		handler: async (args, ctx) => {
-			if (overlayOpen) {
+			if (coordinator.isOverlayOpen()) {
 				ctx.ui.notify("An overlay is already open. Close it first.", "error");
 				return;
 			}
@@ -872,50 +994,77 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 					const sanitizedCommand = s.command.replace(/\s+/g, " ").trim();
 					const sanitizedReason = s.reason?.replace(/\s+/g, " ").trim();
 					const r = sanitizedReason ? ` \u2022 ${sanitizedReason}` : "";
-					return `${s.id} - ${sanitizedCommand}${r} (${status}, ${duration})`;
+					return {
+						id: s.id,
+						label: `${s.id} - ${sanitizedCommand}${r} (${status}, ${duration})`,
+					};
 				});
-				const choice = await ctx.ui.select("Background Sessions", options);
+				const choice = await ctx.ui.select("Background Sessions", options.map((o) => o.label));
 				if (!choice) return;
-				targetId = choice.split(" - ")[0]!;
+				targetId = options.find((o) => o.label === choice)!.id;
 			}
 
-			const monitor = headlessMonitors.get(targetId);
+			const monitor = coordinator.getMonitor(targetId);
+			if (!coordinator.beginOverlay()) {
+				ctx.ui.notify("An overlay is already open. Close it first.", "error");
+				return;
+			}
 
 			const session = sessionManager.get(targetId);
 			if (!session) {
+				disposeStaleMonitor(targetId, monitor);
+				coordinator.endOverlay();
 				ctx.ui.notify(`Session not found: ${targetId}`, "error");
 				return;
 			}
 
-			const config = loadConfig(ctx.cwd);
-			overlayOpen = true;
+			const restoreBackgroundLifecycle = () => {
+				session.session.setEventHandlers({});
+				if (monitor && !monitor.disposed) {
+					return;
+				}
+				if (session.session.exited) {
+					sessionManager.scheduleCleanup(targetId);
+					return;
+				}
+				sessionManager.restartAutoCleanup(targetId);
+			};
+
+			const config = loadRuntimeConfig(ctx.cwd);
 			try {
 				const result = await ctx.ui.custom<InteractiveShellResult>(
 					(tui, theme, _kb, done) =>
-						new ReattachOverlay(tui, theme, { id: session.id, command: session.command, reason: session.reason, session: session.session }, config, done),
-					{
-						overlay: true,
-						overlayOptions: {
-							width: `${config.overlayWidthPercent}%`,
-							maxHeight: `${config.overlayHeightPercent}%`,
-							anchor: "center",
-							margin: 1,
-						},
-					},
+						new ReattachOverlay(
+							tui,
+							theme,
+							{ id: session.id, command: session.command, reason: session.reason, session: session.session },
+							config,
+							done,
+							() => coordinator.unfocusOverlay(),
+						),
+					createOverlayUiOptions(config),
 				);
+
+				emitTransferredOutput(pi, result, targetId);
 
 				if (monitor && !monitor.disposed) {
 					if (!result.backgrounded) {
+						if (result.transferred) {
+							coordinator.markAgentHandledCompletion(targetId);
+						}
 						monitor.handleExternalCompletion(result.exitCode, result.signal, result.completionOutput);
-						headlessMonitors.delete(targetId);
+						coordinator.deleteMonitor(targetId);
 					}
 				} else if (result.backgrounded) {
 					sessionManager.restartAutoCleanup(targetId);
 				} else {
 					sessionManager.scheduleCleanup(targetId);
 				}
+			} catch (error) {
+				restoreBackgroundLifecycle();
+				throw error;
 			} finally {
-				overlayOpen = false;
+				coordinator.endOverlay();
 			}
 		},
 	});
@@ -940,24 +1089,22 @@ export default function interactiveShellExtension(pi: ExtensionAPI) {
 			} else if (sessions.length === 1) {
 				targetIds = [sessions[0].id];
 			} else {
-				const options = ["All sessions", ...sessions.map((s) => {
-					const status = s.session.exited ? "exited" : "running";
-					const duration = formatDuration(Date.now() - s.startedAt.getTime());
-					return `${s.id} (${status}, ${duration})`;
-				})];
-				const choice = await ctx.ui.select("Dismiss sessions", options);
+				const options = [
+					{ label: "All sessions" },
+					...sessions.map((s) => {
+						const status = s.session.exited ? "exited" : "running";
+						const duration = formatDuration(Date.now() - s.startedAt.getTime());
+						return { id: s.id, label: `${s.id} (${status}, ${duration})` };
+					}),
+				];
+				const choice = await ctx.ui.select("Dismiss sessions", options.map((o) => o.label));
 				if (!choice) return;
-				targetIds = choice === "All sessions"
-					? sessions.map(s => s.id)
-					: [choice.split(" (")[0]];
+				const selected = options.find((o) => o.label === choice);
+				targetIds = selected?.id ? [selected.id] : sessions.map((s) => s.id);
 			}
 
 			for (const tid of targetIds) {
-				const monitor = headlessMonitors.get(tid);
-				if (monitor) {
-					monitor.dispose();
-					headlessMonitors.delete(tid);
-				}
+				coordinator.disposeMonitor(tid);
 				sessionManager.unregisterActive(tid, false);
 				sessionManager.remove(tid);
 			}
@@ -980,33 +1127,24 @@ function setupDispatchCompletion(
 		timeout?: number;
 		handsFree?: { autoExitOnQuiet?: boolean; quietThreshold?: number; gracePeriod?: number };
 		overlayStartTime?: number;
+		onOverlayError?: () => { releaseId?: boolean; disposeMonitor?: boolean } | void;
 	},
 ): void {
 	const { id, mode, command, reason } = ctx;
 
 	overlayPromise.then((result) => {
-		overlayOpen = false;
+		coordinator.endOverlay();
 
-		const wasAgentInitiated = agentHandledCompletion;
-		agentHandledCompletion = false;
+		const wasAgentInitiated = coordinator.consumeAgentHandledCompletion(id);
 
 		if (result.transferred) {
-			const truncatedNote = result.transferred.truncated
-				? ` (truncated from ${result.transferred.totalLines} total lines)`
-				: "";
-			const content = `Session ${id} output transferred (${result.transferred.lines.length} lines${truncatedNote}):\n\n${result.transferred.lines.join("\n")}`;
-			pi.sendMessage({
-				customType: "interactive-shell-transfer",
-				content,
-				display: true,
-				details: { sessionId: id, transferred: result.transferred, exitCode: result.exitCode, signal: result.signal },
-			}, { triggerTurn: true });
-			pi.events.emit("interactive-shell:transfer", { sessionId: id, transferred: result.transferred, exitCode: result.exitCode, signal: result.signal });
+			emitTransferredOutput(pi, result, id);
 			sessionManager.unregisterActive(id, true);
+			coordinator.disposeMonitor(id);
+			return;
+		}
 
-			const remainingMonitor = headlessMonitors.get(id);
-			if (remainingMonitor) { remainingMonitor.dispose(); headlessMonitors.delete(id); }
-		} else if (mode === "dispatch" && result.backgrounded) {
+		if (mode === "dispatch" && result.backgrounded) {
 			if (!wasAgentInitiated) {
 				pi.sendMessage({
 					customType: "interactive-shell-transfer",
@@ -1015,33 +1153,39 @@ function setupDispatchCompletion(
 					details: { sessionId: id, backgroundId: result.backgroundId },
 				}, { triggerTurn: true });
 			}
-			sessionManager.unregisterActive(id, false);
 
-			const existingMonitor = headlessMonitors.get(id);
-			if (existingMonitor && !existingMonitor.disposed) {
-				const bgSession = sessionManager.get(result.backgroundId!);
-				if (bgSession) {
-					registerHeadlessActive(result.backgroundId!, command, reason, bgSession.session, existingMonitor, existingMonitor.startTime);
-				}
-			} else if (!existingMonitor) {
-				const bgSession = sessionManager.get(result.backgroundId!);
-				if (bgSession) {
-					const bgId = result.backgroundId!;
-					const bgStartTime = ctx.overlayStartTime ?? Date.now();
-					const elapsed = ctx.overlayStartTime ? Date.now() - ctx.overlayStartTime : 0;
-					const remainingTimeout = ctx.timeout ? Math.max(0, ctx.timeout - elapsed) : undefined;
-
-					const monitor = new HeadlessDispatchMonitor(bgSession.session, config, {
-						autoExitOnQuiet: ctx.handsFree?.autoExitOnQuiet !== false,
-						quietThreshold: ctx.handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
-						gracePeriod: ctx.handsFree?.gracePeriod ?? config.autoExitGracePeriod,
-						timeout: remainingTimeout,
-					}, makeMonitorCompletionCallback(pi, bgId, bgStartTime));
-					headlessMonitors.set(bgId, monitor);
-					registerHeadlessActive(bgId, command, reason, bgSession.session, monitor, bgStartTime);
-				}
+			const bgId = result.backgroundId!;
+			const existingMonitor = coordinator.getMonitor(id);
+			const bgSession = sessionManager.get(bgId);
+			if (!bgSession) {
+				sessionManager.unregisterActive(id, true);
+				coordinator.disposeMonitor(id);
+				return;
 			}
-		} else if (mode === "dispatch") {
+
+			sessionManager.unregisterActive(id, bgId !== id);
+
+			if (existingMonitor && !existingMonitor.disposed) {
+				coordinator.deleteMonitor(id);
+				registerHeadlessActive(bgId, command, reason, bgSession.session, existingMonitor, bgSession.startedAt.getTime(), config);
+				return;
+			}
+
+			const elapsed = ctx.overlayStartTime ? Date.now() - ctx.overlayStartTime : 0;
+			const remainingTimeout = ctx.timeout ? Math.max(0, ctx.timeout - elapsed) : undefined;
+			const bgStartTime = bgSession.startedAt.getTime();
+			const monitor = new HeadlessDispatchMonitor(bgSession.session, config, {
+				autoExitOnQuiet: ctx.handsFree?.autoExitOnQuiet !== false,
+				quietThreshold: ctx.handsFree?.quietThreshold ?? config.handsFreeQuietThreshold,
+				gracePeriod: ctx.handsFree?.gracePeriod ?? config.autoExitGracePeriod,
+				timeout: remainingTimeout,
+				startedAt: bgStartTime,
+			}, makeMonitorCompletionCallback(pi, bgId, bgStartTime));
+			registerHeadlessActive(bgId, command, reason, bgSession.session, monitor, bgStartTime, config);
+			return;
+		}
+
+		if (mode === "dispatch") {
 			if (!wasAgentInitiated) {
 				const content = buildResultNotification(id, result);
 				pi.sendMessage({
@@ -1060,47 +1204,18 @@ function setupDispatchCompletion(
 				cancelled: result.cancelled,
 			});
 			sessionManager.unregisterActive(id, true);
-
-			const remainingMonitor = headlessMonitors.get(id);
-			if (remainingMonitor) { remainingMonitor.dispose(); headlessMonitors.delete(id); }
+			coordinator.disposeMonitor(id);
+			return;
 		}
 
-		if (mode !== "dispatch") {
-			const staleMonitor = headlessMonitors.get(id);
-			if (staleMonitor) { staleMonitor.dispose(); headlessMonitors.delete(id); }
+		coordinator.disposeMonitor(id);
+	}).catch((error) => {
+		console.error(`interactive-shell: overlay error for session ${id}:`, error);
+		coordinator.endOverlay();
+		const recovery = ctx.onOverlayError?.();
+		sessionManager.unregisterActive(id, recovery?.releaseId ?? true);
+		if (recovery?.disposeMonitor !== false) {
+			coordinator.disposeMonitor(id);
 		}
-	}).catch(() => {
-		overlayOpen = false;
-		sessionManager.unregisterActive(id, true);
-		const orphanedMonitor = headlessMonitors.get(id);
-		if (orphanedMonitor) { orphanedMonitor.dispose(); headlessMonitors.delete(id); }
 	});
-}
-
-function buildIdlePromptWarning(command: string, reason: string | undefined): string | null {
-	if (!reason) return null;
-
-	const tasky = /\b(scan|check|review|summariz|analyz|inspect|audit|find|fix|refactor|debug|investigat|explore|enumerat|list)\b/i;
-	if (!tasky.test(reason)) return null;
-
-	const trimmed = command.trim();
-	const binaries = ["pi", "claude", "codex", "gemini", "cursor-agent"] as const;
-	const bin = binaries.find((b) => trimmed === b || trimmed.startsWith(`${b} `));
-	if (!bin) return null;
-
-	const rest = trimmed === bin ? "" : trimmed.slice(bin.length).trim();
-	const hasQuotedPrompt = /["']/.test(rest);
-	const hasKnownPromptFlag =
-		/\b(-p|--print|--prompt|--prompt-interactive|-i|exec)\b/.test(rest) ||
-		(bin === "pi" && /\b-p\b/.test(rest)) ||
-		(bin === "codex" && /\bexec\b/.test(rest));
-
-	if (hasQuotedPrompt || hasKnownPromptFlag) return null;
-	if (rest.length === 0 || /^(-{1,2}[A-Za-z0-9][A-Za-z0-9-]*(?:=[^\s]+)?\s*)+$/.test(rest)) {
-		const examplePrompt = reason.replace(/\s+/g, " ").trim();
-		const clipped = examplePrompt.length > 120 ? `${examplePrompt.slice(0, 117)}...` : examplePrompt;
-		return `Note: \`reason\` is UI-only. This command likely started the agent idle. If you intended an initial prompt, embed it in \`command\`, e.g. \`${bin} "${clipped}"\`.`;
-	}
-
-	return null;
 }
